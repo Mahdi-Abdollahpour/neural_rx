@@ -1,6 +1,7 @@
-sionna == 0.18.0
+sionna==0.18.0
 matplotlib
 pandas
 onnx==1.14
 tf2onnx
 polygraphy
+mitsuba==3.5.2 # not specified sionna==0.18.0
