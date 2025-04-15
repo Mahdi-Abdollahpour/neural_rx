@@ -158,8 +158,12 @@ class DataGeneratorAerial(Model):
 
             # ignore empty pilots (they are ignored in Aerial)
             p = self._pilots[i,0,:]
+
+            idx = np.unique(idx[-1])
+            p = p.numpy()[idx]
             # pilot DMRS subcarrier positions
-            idx_active_pilots = np.where(np.abs(p)>0)[0]
+            idx_active_pilots = idx[np.where(np.abs(p)>0)[0]]
+
             # we only focus on the first PRB (i.e. 12 subcarriers)
             idx_per_prb = idx_active_pilots[np.where(idx_active_pilots<12)]
             dmrs_subcarrier_pos_.append(idx_per_prb)
@@ -390,7 +394,7 @@ class DataGeneratorAerial(Model):
         # ignore zero pilots
         #h_hat = h_hat[...,::2] # remove 0 pilots; only works with DMRS port 0,1
         s = h_hat.shape.as_list()
-        s[-1] = s[-1]//2
+        s[-1] = s[-1]//self._sys_parameters.num_cdm_groups_without_data
         h_hat = tf.gather_nd(h_hat, tf.where(tf.abs(h_hat)>1e-7))
         # recover original shape (except that every other pilot was removed
         # in last dimension)
