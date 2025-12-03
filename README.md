@@ -32,7 +32,7 @@ We recommend starting with the [Jumpstart NRX Tutorial notebook](notebooks/jumps
 
 The basic neural receiver architecture is introduced and described in [a Neural Receiver for 5G NR Multi-user MIMO](https://arxiv.org/pdf/2312.02601) [1].
 The real-time experiments and the site-specific training is described in [Design of a Standard-Compliant Real-Time
-Neural Receiver for 5G NR](TODO) [2].
+Neural Receiver for 5G NR](https://arxiv.org/abs/2409.02912) [2].
 
 Demos of this receiver architecture have been shown at [Mobile World Congress 2023](https://www.youtube.com/watch?v=BQyxBYzdg5k) and [Mobile World Congress 2024](https://www.keysight.com/us/en/assets/3124-1306/demos/6G-AI-Neural-Receiver-Design.mp4).
 
