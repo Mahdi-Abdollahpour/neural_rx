@@ -9,14 +9,20 @@
 # its affiliates is strictly prohibited.
 
 ##### E2E model for system evaluations #####
+import core.runtime as _runtime
 
 import tensorflow as tf
 from tensorflow.keras import Model
 from sionna.channel import gen_single_sector_topology
-from sionna.utils import BinarySource, ebnodb2no, expand_to_rank, log10
-from .baseline_rx import BaselineReceiver
-from .neural_rx import NeuralPUSCHReceiver
+from sionna.utils import BinarySource, ebnodb2no, expand_to_rank, log10, flatten_dims, split_dim, insert_dims
+from receivers.baseline_rx import BaselineReceiver
+from receivers.deep_echo import DeepEcho5G
+from receivers.deep_echo_kbest import DeepEchoKBest5G
+from receivers.md_rx import MDNeuralPUSCHReceiver
+from receivers.neural_rx import NeuralPUSCHReceiver
+from receivers.neural_rx_kbest import NeuralKBestPUSCHReceiver
 
+# from sionna.utils import flatten_dims, split_dim, flatten_last_dims, insert_dims, expand_to_rank, matrix_inv
 
 class E2E_Model(Model):
     r"""E2E_Model(sys_parameters, training=False, return_tb_status=False, **kwargs)
@@ -120,7 +126,7 @@ class E2E_Model(Model):
     """
 
     def __init__(self, sys_parameters, training=False, return_tb_status=False,
-                 mcs_arr_eval_idx=0):
+                 mcs_arr_eval_idx=0, output_channel_est_only=False):
 
         super().__init__()
 
@@ -130,14 +136,15 @@ class E2E_Model(Model):
         self._training = training
         self._return_tb_status = return_tb_status
         self._mcs_arr_eval_idx = mcs_arr_eval_idx
-
+        self._output_channel_est_only = output_channel_est_only
         ###################################
         # Transmitter
         ###################################
 
         self._source = BinarySource()
         self._transmitters = sys_parameters.transmitters
-
+        if hasattr(sys_parameters.transmitters[0], "_precoder"):
+            self._precoding_mat = sys_parameters.transmitters[0]._precoder._w
         ###################################
         # Channel
         ###################################
@@ -188,14 +195,64 @@ class E2E_Model(Model):
                                 self._sys_parameters,
                                 return_tb_status=return_tb_status,
                                 mcs_arr_eval_idx=mcs_arr_eval_idx)
-
+        elif self._sys_parameters.system == 'baseline_lslin_kbest':
+            self._sys_name = f"Baseline - LS/lin+K-Best"
+            self._receiver = BaselineReceiver(
+                                self._sys_parameters,
+                                return_tb_status=return_tb_status,
+                                mcs_arr_eval_idx=mcs_arr_eval_idx)
         elif self._sys_parameters.system == "nrx":
             self._sys_name = "Neural Receiver"
             self._receiver = NeuralPUSCHReceiver(
                                     self._sys_parameters,
                                     training)
+        elif self._sys_parameters.system == "nrx_kbest":
+            self._sys_name = "Neural Receiver + K-Best"
+            self._receiver = NeuralKBestPUSCHReceiver(
+                                    self._sys_parameters,
+                                    training)
+        elif self._sys_parameters.system == "mdx":
+            self._sys_name = "Model Driven Receiver"
+            self._receiver = MDNeuralPUSCHReceiver(
+                                    self._sys_parameters,
+                                    training)
+        elif self._sys_parameters.system == "deep_echo":
+            self._sys_name = "Deep Echo Multi-Path Component Estimatore"
+            self._receiver = DeepEcho5G(
+                                    self._sys_parameters,
+                                    training)
+        elif self._sys_parameters.system == "deep_echo_kbest":
+            self._sys_name = "Deep Echo + K-Best"
+            self._receiver = DeepEchoKBest5G(
+                                    self._sys_parameters,
+                                    training)
         else:
             raise NotImplementedError("Unknown system selected!")
+
+    def _apply_precoding_effect(self, h):
+        # apply precoding matrix to channel
+        # h : [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_effective_subcarriers]
+
+        # Assume only one rx
+        # [batch_size, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+        h = tf.squeeze(h, axis=1)
+
+        # Reshape h
+        # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant, num_tx_ant]
+        h = tf.transpose(h, perm=[0,2,5,4,1,3])
+
+        # precoding_mat[num_tx, num_tx_ant, num_layers = 1]
+        # to           [1, num_tx, 1, 1, num_tx_ant, 1]
+        w = insert_dims(tf.expand_dims(self._precoding_mat, axis=0), 2, 2)
+
+        # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
+        h = tf.squeeze(tf.matmul(h, w), axis=-1)
+
+        # # Complex-to-real
+        # # [batch size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+        # h = tf.concat([tf.math.real(h), tf.math.imag(h)], axis=-1)
+
+        return h
 
     def _active_dmrs_mask(self, batch_size, num_tx, max_num_tx):
         """Sample mask of num_tx active DMRS ports (=users/streams).
@@ -271,9 +328,11 @@ class E2E_Model(Model):
         for mcs_list_idx in range(len(self._sys_parameters.mcs_index)):
             self._transmitters[mcs_list_idx].pilot_pattern.pilots = pilots
 
-    def call(self, batch_size, ebno_db, num_tx=None, output_nrx_h_hat=False,
+    def call(self, batch_size, ebno_db, num_tx=None, return_channel=False,  # ---------------------------  Call ---------------------------
              mcs_arr_eval_idx=None, mcs_ue_mask=None, active_dmrs=None):
         """defines end-to-end system model."""
+
+        # mcs_ue_mask: [batch_size, max_num_tx, depth], depth being num supported MCSs
 
         # randomly sample num_tx active dmrs ports
         if num_tx is None:
@@ -289,7 +348,9 @@ class E2E_Model(Model):
                                 batch_size,
                                 num_tx,
                                 self._sys_parameters.max_num_tx)
+            # print(f"active_dmrs:{active_dmrs.shape} {active_dmrs},num_tx:{num_tx}")
 
+        # mcs_ue_mask: [batch_size, max_num_tx, depth], depth being num supported MCSs
         if mcs_ue_mask is None:
             # No mcs-to-ue-mask specified --> evaluate pre-specified MCS only
             assert isinstance(mcs_arr_eval_idx, int), "Pre-defined MCS UE mask only works if mcs_arr_eval_idx is an integer"
@@ -332,23 +393,30 @@ class E2E_Model(Model):
             self._set_transmitter_random_pilots()
 
         # Combine transmit signals from all MCSs
+        # mcs_ue_mask: [batch_size, max_num_tx, depth], depth being num supported MCSs
+        # _mcs_ue_mask:[batch_size, max_num_tx, num_selected_mcs(1), 1, 1]
+        # transmitters is a list of PUSCHTransmitters, one for each MCS
+        # self._transmitters[mcs_arr_eval[0]](b[0]): [batch_size, max_num_tx, tx_ant, num_ofdm_syms, fft_size]
+        # x: [batch_size, max_num_tx, tx_ant, num_ofdm_syms, fft_size]
         _mcs_ue_mask = tf.cast(expand_to_rank(
                                     tf.gather(mcs_ue_mask,
                                               indices=mcs_arr_eval[0],
                                               axis=2), 5, axis=-1),
                                               dtype=tf.complex64)
-        x = _mcs_ue_mask * self._transmitters[mcs_arr_eval[0]](b[0])
+        x = _mcs_ue_mask * self._transmitters[mcs_arr_eval[0]](b[0]) # mul by zeros all tx with MACs != mcs_arr_eval[0]
+
         for idx in range(1, len(mcs_arr_eval)):
             _mcs_ue_mask = tf.cast(expand_to_rank(
                                         tf.gather(mcs_ue_mask,
                                                   indices=mcs_arr_eval[idx],
                                                   axis=2), 5, axis=-1),
                                                   dtype=tf.complex64)
-            x = x + _mcs_ue_mask * self._transmitters[mcs_arr_eval[idx]](b[idx])
-
+            x = x + _mcs_ue_mask * self._transmitters[mcs_arr_eval[idx]](b[idx])# mul by zeros all tx with MACs != mcs_arr_eval[idx]
+            
         # mask non-active DMRS ports by multiplying with 0
         a_tx = expand_to_rank(active_dmrs, tf.rank(x), axis=-1)
         x = tf.multiply(x, tf.cast(a_tx, tf.complex64))
+
 
         ###################################
         # Channel
@@ -386,6 +454,7 @@ class E2E_Model(Model):
 
         else:
             # ebno_db is actually SNR when self._sys_parameters.ebno==False
+            # [batch_size]
             no = 10**(-ebno_db/10)
 
         # Update topology only required for 3GPP UMi/UMa models
@@ -402,15 +471,51 @@ class E2E_Model(Model):
                         min_ut_velocity=self._sys_parameters.min_ut_velocity,
                         max_ut_velocity=self._sys_parameters.max_ut_velocity,
                         indoor_probability=0.) # disable indoor users
+            # ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state = topology
             self._sys_parameters.channel_model.set_topology(*topology)
-
         # Apply channel
         if self._sys_parameters.channel_type == "AWGN":
+            # [batch_size, max_num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
             y = self._channel([x, no])
             h = tf.ones_like(y) # simple AWGN channel
+
+            max_num_tx = y.shape[1]
+            num_tx_ant = y.shape[2]
+            # [batch_size, max_num_tx * num_tx_ant, num_ofdm_symbols, fft_size]
+            y = flatten_dims(y,num_dims=2,axis=1)
+            h = flatten_dims(h,num_dims=2,axis=1)
+
+            # [batch_size, 1, max_num_tx * num_tx_ant (num_rx_ant), num_ofdm_symbols, fft_size]
+            y = tf.expand_dims(y,axis=1)
+
+            # [batch_size, num_ofdm_symbols, fft_size, max_num_tx * num_tx_ant]
+            h = tf.transpose(h, perm=[0,2,3,1])
+
+            # [batch_size, num_ofdm_symbols, fft_size, max_num_tx * num_tx_ant, max_num_tx * num_tx_ant]
+            h = tf.linalg.diag(h)
+
+            # [batch_size,  max_num_tx * num_tx_ant (num_rx_ant), max_num_tx * num_tx_ant, num_ofdm_symbols, fft_size]
+            h = tf.transpose(h, perm=[0, 4, 3,1,2])
+            # [batch_size,  max_num_tx * num_tx_ant (num_rx_ant), max_num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+            h = split_dim(h,[max_num_tx, num_tx_ant],axis=2)
+            # [batch_size, 1, max_num_tx * num_tx_ant (num_rx_ant), max_num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+            h= tf.expand_dims(h,axis=1)
+
         else:
             y, h = self._channel([x, no])
 
+        
+        # [batch_size, num_tx, num_rx, num_clusters, num_rays, 4]
+        # print(f"[e2e] {self._sys_parameters.channel_model.channel_params.phi[0,0,0,0,0,:]}")
+
+        # h : [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_effective_subcarriers]
+        # print(f"h[batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant,num_ofdm_symbols, num_effective_subcarriers]:{tf.shape(h)}")
+        # print(f"x[batch_size, max_num_tx, num_tx_ant, num_ofdm_symbols, fft_size]:{x.shape}")
+        # print(f"y[batch_size, num_rx, num_rx_ant, num_ofdm_symbols, num_subcarriers]:{y.shape}")
+        
+
+
+        h_perf = self._apply_precoding_effect(h) # TODO: remove inactive users
         ###################################
         # Receiver
         ###################################
@@ -418,19 +523,47 @@ class E2E_Model(Model):
         if self._sys_parameters.system in ('baseline_lmmse_kbest',
                                            'baseline_lmmse_lmmse',
                                            'baseline_lsnn_lmmse',
-                                           'baseline_lslin_lmmse'):
+                                           'baseline_lslin_lmmse',
+                                           'baseline_lslin_kbest'):
             b_hat = self._receiver([y, no])
             if self._return_tb_status:
-                b_hat, tb_crc_status = b_hat
+                b_hat, tb_crc_status, h_hat = b_hat
             else:
+                b_hat, h_hat = b_hat
                 tb_crc_status = None
 
             # return b[0] and b_hat only for active DMRS ports
             # b only holds bits corresponding to MCS indices specified
             # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
-            return self._mask_active_dmrs(b[0], b_hat, num_tx,
+            b, b_hat = self._mask_active_dmrs(b[0], b_hat, num_tx,
                                           active_dmrs, mcs_arr_eval[0],
                                           tb_crc_status)
+            
+            if h_hat is not None: # single rx and single stream assumed
+                # [batch size, num_rx, num_rx_ant, num_tx, num_streams,...
+                #  ...num_ofdm_symbols, fft_size]
+                # to [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
+                h_hat = tf.squeeze(h_hat, axis=(1,4,)) #[B,RA,T,14, F]
+                h_hat = tf.transpose(h_hat, perm=[0,2,4,3,1]) #[B,T,F,14,RA]
+
+
+            if self._output_channel_est_only:
+                return h_perf, h_hat
+            return b, b_hat, h_perf, h_hat
+            # h_hat [batch_size, num_tx, num_effective_subcarriers,
+            #                     num_ofdm_symbols, 2*num_rx_ant]
+
+            # h_hat_refined=None
+            # if self._return_tb_status:
+            #     if return_channel:
+            #             return b, b_hat, tb_crc_status, h, h_hat
+            #         else:
+            #             return b, b_hat, tb_crc_status
+            #     else:
+            #         if return_channel:
+            #             return b, b_hat, h, h_hat
+            #         else:
+            #             return b, b_hat
 
         elif self._sys_parameters.system in ('baseline_perf_csi_kbest',
                                              'baseline_perf_csi_lmmse'):
@@ -438,10 +571,18 @@ class E2E_Model(Model):
             # perfect CSI receiver needs ground truth channel
             b_hat = self._receiver([y, h, no])
 
+            # if self._return_tb_status:
+            #     b_hat, tb_crc_status = b_hat
+            # else:
+            #     tb_crc_status = None
+
+
             if self._return_tb_status:
-                b_hat, tb_crc_status = b_hat
+                b_hat, tb_crc_status, h_hat = b_hat
             else:
+                b_hat, h_hat = b_hat
                 tb_crc_status = None
+
             # return b[0] and b_hat only for active DMRS ports
             # b only holds bits corresponding to MCS indices specified
             # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
@@ -449,7 +590,7 @@ class E2E_Model(Model):
                                           active_dmrs, mcs_arr_eval[0],
                                           tb_crc_status)
 
-        elif self._sys_parameters.system == "nrx":
+        elif self._sys_parameters.system in ("nrx", "nrx_kbest"):
 
             # in training mode, only the losses are required
             if self._training:
@@ -462,10 +603,17 @@ class E2E_Model(Model):
                 # - refined channel estimate h_hat_refined
                 # - initial channel estimate h_hat
                 # - [optional] transport block CRC status
+                # print(f"y:{y.shape}")
+                # print(f"y:{tf.shape(y)}")
+                if self._sys_parameters.system == "nrx_kbest":
+                    receiver_inputs = (y, active_dmrs, no)
+                else:
+                    receiver_inputs = (y, active_dmrs)
                 b_hat, h_hat_refined, h_hat, tb_crc_status = \
-                                self._receiver((y, active_dmrs),
+                                self._receiver(receiver_inputs,
                                                 mcs_arr_eval,
                                                 mcs_ue_mask_eval=mcs_ue_mask)
+                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
 
                 #################################
                 # Only focus on active DMRS ports
@@ -487,6 +635,7 @@ class E2E_Model(Model):
                                         tf.rank(h_hat_refined), axis=-1)
                 a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
                 if h_hat is not None:
+                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
                     h_hat = tf.boolean_mask(h_hat, a_mask)
                     h_hat = tf.reshape(h_hat, h_hat_output_shape)
                 h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
@@ -498,15 +647,159 @@ class E2E_Model(Model):
 
                 # if activated, return channel estimates (and ground truth CFRs)
                 if self._return_tb_status:
-                    if output_nrx_h_hat:
+                    if return_channel:
                         return b, b_hat, tb_crc_status, h, h_hat_refined, h_hat
                     else:
                         return b, b_hat, tb_crc_status
                 else:
-                    if output_nrx_h_hat:
+                    if return_channel:
                         return b, b_hat, h, h_hat_refined, h_hat
                     else:
                         return b, b_hat
+
+        elif self._sys_parameters.system == "mdx":
+
+            # in training mode, only the losses are required
+            if self._training:
+                losses = self._receiver([y, active_dmrs, b, h, mcs_ue_mask, x, no, batch_size],
+                                        mcs_arr_eval)
+                                        
+                return losses
+            else:
+                # in inference mode, the neural receiver returns:
+                # - reconstructed payload bits b_hat
+                # - refined channel estimate h_hat_refined
+                # - initial channel estimate h_hat
+                # - [optional] transport block CRC status
+                # print(f"y:{y.shape}")
+                # print(f"y:{tf.shape(y)}")
+                b_hat, h_hat_refined, h_hat, tb_crc_status = \
+                                self._receiver((y, active_dmrs, no, mcs_ue_mask,x,h, batch_size),
+                                                mcs_arr_eval=mcs_arr_eval,
+                                                mcs_ue_mask_eval=mcs_ue_mask)
+                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
+
+                #################################
+                # Only focus on active DMRS ports
+                #################################
+                # Data
+                # b only holds bits corresponding to MCS indices specified
+                # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
+                b, b_hat, tb_crc_status = self._mask_active_dmrs(b[0], b_hat,
+                                                                num_tx,
+                                                                active_dmrs,
+                                                                mcs_arr_eval[0],
+                                                                tb_crc_status)
+
+                # Channel estimates
+                h_hat_output_shape = tf.concat([[batch_size, num_tx],
+                                                tf.shape(h_hat_refined)[2:]],
+                                                axis=0)
+                a_mask = expand_to_rank(active_dmrs,
+                                        tf.rank(h_hat_refined), axis=-1)
+                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
+                if h_hat is not None:
+                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
+                    h_hat = tf.boolean_mask(h_hat, a_mask)
+                    h_hat = tf.reshape(h_hat, h_hat_output_shape)
+                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
+                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)
+                # Channel ground truth
+                h = self._receiver.preprocess_channel_ground_truth(h)
+                h = tf.boolean_mask(h, a_mask)
+                h = tf.reshape(h, h_hat_output_shape)
+
+                # 
+
+
+
+
+                # if activated, return channel estimates (and ground truth CFRs)
+                if self._return_tb_status:
+                    if return_channel:
+                        return b, b_hat, tb_crc_status, h, h_hat_refined, h_hat
+                    else:
+                        return b, b_hat, tb_crc_status
+                else:
+                    if return_channel:
+                        return b, b_hat, h, h_hat_refined, h_hat
+                    else:
+                        return b, b_hat
+
+
+        elif self._sys_parameters.system in ("deep_echo", "deep_echo_kbest"):
+
+            # in training mode, only the losses are required
+            if self._training:
+
+                losses = self._receiver([y, active_dmrs, b, h, mcs_ue_mask, no], mcs_arr_eval)
+                                        
+                return losses
+            else:
+
+                b_hat, h_hat_refined, h_hat, tb_crc_status = \
+                                self._receiver((y, active_dmrs, no, mcs_ue_mask,x,h, batch_size),
+                                                mcs_arr_eval=mcs_arr_eval,
+                                                mcs_ue_mask_eval=mcs_ue_mask)
+                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
+
+                #################################
+                # Only focus on active DMRS ports
+                #################################
+                # Data
+                # b only holds bits corresponding to MCS indices specified
+                # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
+                b, b_hat, tb_crc_status = self._mask_active_dmrs(b[0], b_hat,
+                                                                num_tx,
+                                                                active_dmrs,
+                                                                mcs_arr_eval[0],
+                                                                tb_crc_status)
+
+                # Channel estimates
+                h_hat_output_shape = tf.concat([[batch_size, num_tx],
+                                                tf.shape(h_hat_refined)[2:]],
+                                                axis=0)
+                a_mask = expand_to_rank(active_dmrs,
+                                        tf.rank(h_hat_refined), axis=-1)
+                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
+                if h_hat is not None:
+                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
+                    h_hat = tf.boolean_mask(h_hat, a_mask)
+                    h_hat = tf.reshape(h_hat, h_hat_output_shape)
+                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
+                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)
+                # Channel ground truth
+                h = self._receiver.preprocess_channel_ground_truth(h)
+                h = tf.boolean_mask(h, a_mask)
+                h = tf.reshape(h, h_hat_output_shape)
+
+
+
+                if self._output_channel_est_only:
+                    # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+                    # to [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
+                    real_part, imag_part = tf.split(h_hat_refined, num_or_size_splits=2, axis=-1)
+                    h_hat_refined = tf.complex(real_part,imag_part)
+                    return h_perf, h_hat_refined
+
+
+
+                # if activated, return channel estimates (and ground truth CFRs)
+                if self._return_tb_status:
+                    if return_channel:
+                        return b, b_hat, tb_crc_status, h, h_hat_refined, h_hat
+                    else:
+                        return b, b_hat, tb_crc_status
+                else:
+                    if return_channel:
+                        return b, b_hat, h, h_hat_refined, h_hat
+                    else:
+                        return b, b_hat
+
+
+
+
+
         else:
             raise ValueError("Unknown system selected!")
 
