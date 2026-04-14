@@ -200,6 +200,18 @@ class BaselineReceiver(Layer):
             #self._est = LSChannelEstimator(
             #            resource_grid=sys_parameters.transmitters[mcs_arr_eval_idx]._resource_grid,
             #            interpolation_type="lin")
+        elif sys_parameters.system in ('baseline_lslin_kbest'):
+            pc = sys_parameters.pusch_configs[mcs_arr_eval_idx][0]
+            self._est = PUSCHLSChannelEstimator(
+                resource_grid=sys_parameters.transmitters[mcs_arr_eval_idx]._resource_grid,
+                dmrs_length=pc.dmrs.length,
+                dmrs_additional_position=pc.dmrs.additional_position,
+                num_cdm_groups_without_data=pc.dmrs.num_cdm_groups_without_data,
+                interpolation_type="lin"
+            )
+            #self._est = LSChannelEstimator(
+            #            resource_grid=sys_parameters.transmitters[mcs_arr_eval_idx]._resource_grid,
+            #            interpolation_type="lin")
         elif sys_parameters.system in ('baseline_perf_csi_lmmse',
                                        'baseline_perf_csi_kbest'):
             self._est = "perfect"
@@ -208,7 +220,8 @@ class BaselineReceiver(Layer):
         # Detection
         ###################################
         if sys_parameters.system in ('baseline_lmmse_kbest',
-                                     'baseline_perf_csi_kbest'):
+                                     'baseline_perf_csi_kbest',
+                                     'baseline_lslin_kbest'):
             # Init K-best detector
             self._detector = KBestDetector(
                 "bit",
@@ -252,7 +265,8 @@ class BaselineReceiver(Layer):
             tb_decoder=self._decoder,
             stream_management=None,  # Will be derived from transmitters
             input_domain="freq",
-            return_tb_crc_status=self._return_tb_status
+            return_tb_crc_status=self._return_tb_status,
+            return_ch_est=True
         )
 
     def call(self, inputs):
@@ -263,6 +277,9 @@ class BaselineReceiver(Layer):
         else:
             y, no = inputs
             b_hat = self._receiver([y, no])
+
+        # h_hat [batch size, num_rx, num_rx_ant, num_tx, num_streams,...
+        #  ...num_ofdm_symbols, fft_size]
         return b_hat
 
 # The following LMMSE estimator implementations are used to keep the
@@ -428,15 +445,23 @@ class LowComplexityPUSCHLMSEEstimator(PUSCHLSChannelEstimator):
         s.append(1)  # num_layer
         s.append(self._num_pilots)
 
+
         h_hat = tf.ensure_shape(h_hat, shape=s)
         err_var = tf.ensure_shape(err_var, shape=s)
+        # print(f"h_hat:{tf.shape(h_hat)}")     #h_hat:[   3    1    4    2    1 3168]
 
-        h_hat2 = split_dim(h_hat, [2, -1], axis=tf.rank(h_hat) - 1)
+        # [batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, num_pilots]
+        # [batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, 2, num_pilots/2]
+        h_hat2 = split_dim(h_hat, [2, -1], axis=tf.rank(h_hat) - 1)  # split last axis
+        # [batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, 2, reduction, num_pilots/2/reduction]
         h_hat3 = split_dim(h_hat2, [self._reduction, -1],
                            axis=tf.rank(h_hat2) - 1)
+        # [reduction, batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, 2, num_pilots/2/reduction]
         h_hat4 = tf.transpose(h_hat3, perm=[6, 0, 1, 2, 3, 4, 5, 7])
+        # [reduction, batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, 2*num_pilots/2/reduction]
         h_hat5 = flatten_last_dims(h_hat4, 2)
-        h_hat6 = flatten_dims(h_hat5, 2, 0)
+        # [reduction* batch_size_eval_small, num_rx, num_rx_antennas, max_num_tx, 1, 2*num_pilots/2/reduction]
+        h_hat6 = flatten_dims(h_hat5, 2, 0)     #flatten_dims(tensor, num_dims, axis)
 
         err_var2 = split_dim(err_var, [2, -1], axis=tf.rank(err_var) - 1)
         err_var3 = split_dim(err_var2, [self._reduction, -1],

@@ -329,6 +329,17 @@ class UpdateState(Layer):
         self._output_conv = layer(d_s, (3,3), padding='same',
                                   activation=None, dtype=dtype)
 
+
+    # def build(self, input_shape):
+    #     # Create a learnable parameter
+    #     self.skip_scalar = self.add_weight(
+    #         shape=(),  
+    #         initializer=tf.keras.initializers.Constant(0.5),  
+    #         trainable=True, 
+    #         name="skip_scalar"
+    #     )
+    #     super(UpdateState, self).build(input_shape)  # Call the base build method
+
     def call(self, inputs):
         s, a, pe = inputs
 
@@ -366,7 +377,8 @@ class UpdateState(Layer):
             z = conv(z)
         z = self._output_conv(z)
         # Skip connection
-        z = z + s
+        # z = (1-self.skip_scalar)*z + self.skip_scalar*s
+        z = z+s
         # Unflatten
         s_new = split_dim(z, [batch_size, num_tx], 0)
 

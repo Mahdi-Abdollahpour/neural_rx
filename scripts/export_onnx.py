@@ -66,7 +66,7 @@ except RuntimeError as e:
 
 import numpy as np
 
-from receivers.neural_rx import NeuralReceiverONNX
+from ext.neural_rx.utils.neural_rx import NeuralReceiverONNX
 from ext.neural_rx.utils.onnx_utils import DataEvaluator, DataGeneratorAerial
 from ext.neural_rx.utils.parameters import Parameters
 from ext.neural_rx.utils.utils import load_weights

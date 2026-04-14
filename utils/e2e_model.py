@@ -15,11 +15,11 @@ import tensorflow as tf
 from tensorflow.keras import Model
 from sionna.channel import gen_single_sector_topology
 from sionna.utils import BinarySource, ebnodb2no, expand_to_rank, log10, flatten_dims, split_dim, insert_dims
-from receivers.baseline_rx import BaselineReceiver
+from .baseline_rx import BaselineReceiver
 from receivers.deep_echo import DeepEcho5G
 from receivers.deep_echo_kbest import DeepEchoKBest5G
 from receivers.md_rx import MDNeuralPUSCHReceiver
-from receivers.neural_rx import NeuralPUSCHReceiver
+from .neural_rx import NeuralPUSCHReceiver
 from receivers.neural_rx_kbest import NeuralKBestPUSCHReceiver
 
 # from sionna.utils import flatten_dims, split_dim, flatten_last_dims, insert_dims, expand_to_rank, matrix_inv
