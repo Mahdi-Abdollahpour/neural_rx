@@ -9,6 +9,7 @@
 # its affiliates is strictly prohibited.
 
 ##### Hardware impairment layers
+import core.runtime as _runtime
 
 from tensorflow.keras.layers import Layer
 import tensorflow as tf

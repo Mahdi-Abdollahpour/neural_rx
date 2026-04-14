@@ -10,6 +10,10 @@
 
 # Implements baseline receiver algorithms for performance evaluation
 
+from ._bootstrap import ensure_local_sionna
+
+ensure_local_sionna()
+
 from tensorflow.keras.layers import Layer
 import tensorflow as tf
 from itertools import combinations

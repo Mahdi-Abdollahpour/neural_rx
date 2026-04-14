@@ -10,6 +10,10 @@
 
 ##### Neural Receiver #####
 
+from ._bootstrap import ensure_local_sionna
+
+ensure_local_sionna()
+
 import tensorflow as tf
 import numpy as np
 from tensorflow.keras import Model

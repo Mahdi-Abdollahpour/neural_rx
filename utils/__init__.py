@@ -8,6 +8,10 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
+from ._bootstrap import ensure_local_sionna
+
+ensure_local_sionna()
+
 from .baseline_rx import BaselineReceiver
 from .e2e_model import E2E_Model
 from .neural_rx import NeuralPUSCHReceiver, NeuralReceiverONNX

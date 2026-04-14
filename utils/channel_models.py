@@ -9,13 +9,17 @@
 # its affiliates is strictly prohibited.
 
 # Implements different channel models for performance evaluation
+import core.runtime as _runtime
+from core.runtime import DEBUGD
 
 from tensorflow.keras.layers import Layer
 import tensorflow as tf
 import numpy as np
 import sionna
 from sionna.channel import GenerateOFDMChannel, ApplyOFDMChannel, ChannelModel
-from sionna.channel.tr38901 import TDL
+from sionna.channel.tr38901 import CDL, TDL
+from sionna.channel.utils import exp_corr_mat
+import random
 
 def gnb_correlation_matrix(num_ant, alpha):
     assert num_ant in [1,2,4,8]
@@ -35,6 +39,304 @@ def gnb_correlation_matrix(num_ant, alpha):
 def ue_correlation_matrix(num_ant, beta):
     assert num_ant in [1,2,4]
     return gnb_correlation_matrix(num_ant, beta)
+
+
+
+class NTDLChannel(tf.keras.layers.Layer):
+    """
+    Channel model that stacks a 3GPP TDL-B100-400 and TDL-C-300-100 channel
+    model. This allows to benchmark N user system in a 3GPP compliant
+    scenario.
+
+    Parameters
+    ---------
+    carrier_frequency: float
+        Carrier frequency of the simulation.
+
+    resource_grid: ResourceGrid
+        Resource grid used for the simulation.
+
+    num_rx_ant: int
+        Number of receiver antennas.
+
+    num_tx_ant: int
+        Number of transmit antennas for each user.
+
+    norm_channel: bool
+        If True, the channel is normalized.
+
+    correlation: "low" | "medium" | "high"
+        Antenna correlation according to 38.901.
+
+    Input
+    -----
+
+    (x, no) or x:
+        Tuple or Tensor:
+
+    x :  [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size],
+         tf.complex
+        Channel inputs
+
+    no : Scalar or Tensor, tf.float
+        Scalar or tensor whose shape can be broadcast to the shape of the
+        channel outputs
+
+    Output
+    -------
+    y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], tf.complex
+        Channel outputs
+    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant,
+              num_ofdm_symbols, fft_size], tf.complex
+        Channel frequency responses.
+    """
+    def __init__(self,
+                 carrier_frequency,
+                 resource_grid,
+                 num_rx_ant=16,
+                 num_tx_ant=2,
+                 max_num_tx=4,
+                 norm_channel=False,
+                 correlation="low",
+                 tdl_models=["A"], # A, B, C, D, E
+                 delay_spread_min=10,   # in nano seconds
+                 delay_spread_max=300,  # in nano seconds
+                 doppler_shift_max=325  # Hz
+                 ):
+        super().__init__()
+
+
+
+
+        assert correlation in ["low", "medium", "high"]
+
+        print(f"\n\tLoading NTDL {tdl_models} with {correlation} correlation.\n")
+
+        # print(f"[NTDL] num_rx_ant:{num_rx_ant}, num_tx_ant:{num_tx_ant}, max_num_tx:{max_num_tx}")
+
+        if correlation=="low":
+            alpha = beta = 0
+        elif correlation=="medium":
+            alpha = 0.9
+            beta = 0.3
+        else:
+            alpha = 0.9
+            beta = 0.9
+
+
+        self._tx_corr_mat = exp_corr_mat(beta, num_tx_ant)
+        self._rx_corr_mat = exp_corr_mat(alpha, num_rx_ant)
+
+        self._max_num_tx = max_num_tx
+        self._num_rx_ant = num_rx_ant
+        self._num_tx_ant = num_tx_ant
+        self._delay_spread_min = delay_spread_min
+        self._delay_spread_max = delay_spread_max
+        self._doppler_shift_max = doppler_shift_max
+        self._carrier_frequency = carrier_frequency
+        self._tdl_models = tdl_models
+        self._resource_grid = resource_grid
+        self._norm_channel = norm_channel
+        self._apply_channel = ApplyOFDMChannel()
+        self._speed = self._doppler_shift_max * sionna.SPEED_OF_LIGHT / self._carrier_frequency
+        self._num_tdls = len(tdl_models)
+
+
+        if len(tdl_models) < max_num_tx:
+            # Calculate how many times to repeat the list so that its length becomes greater than max_num_tx
+            repeat_times = (max_num_tx // len(tdl_models)) + 1
+            tdl_models = tdl_models * repeat_times
+
+
+        self._gens = []
+        self._tdls = []
+        for model in tdl_models:
+
+            # delay_spread = tf.random.uniform(
+            #     shape=(), 
+            #     minval=self._delay_spread_min, 
+            #     maxval=self._delay_spread_max, 
+            #     dtype=tf.float32
+            # )
+            # delay_spread = delay_spread*1e-9 # seconds
+            delay_spread = delay_spread_max*1e-9 # seconds
+
+            # Randomly select a model if more than one provided
+            # selected_model = self._tdl_models[0]
+            # if len(self._tdl_models)>1:
+            #     selected_model = random.choice(self._tdl_models)
+
+
+            tdl = TDL(model,
+                      delay_spread,
+                      self._carrier_frequency,
+                      max_speed=self._speed,
+                      num_tx_ant=self._num_tx_ant,
+                      num_rx_ant=self._num_rx_ant,
+                      rx_corr_mat=self._rx_corr_mat,
+                      tx_corr_mat=self._tx_corr_mat)
+
+            gen_channel = GenerateOFDMChannel_(
+                tdl,
+                self._resource_grid,
+                normalize_channel=self._norm_channel
+            )
+            # self._tdls.append(tdl)
+            self._gens.append(gen_channel)
+
+
+    def call(self, inputs):
+
+        x, no = inputs
+        size = tf.shape(x)
+        batch_size = size[0]
+        num_tx = size[1]
+        # print(f"x size:{size}")
+
+        k = len(self._gens) 
+
+        # delay_spread = tf.random.uniform(
+        #                 shape=(),           
+        #                 minval=self._delay_spread_min,
+        #                 maxval=self._delay_spread_max,
+        #                 dtype=tf.float32    
+        #             ) * 1e-9 # nano Seconds
+
+        # Step 1: Compute all channels with random delay spread
+        # outputs = [gen(batch_size,delay_spread=delay_spread) for gen in self._gens]
+        outputs = [
+            gen(
+                batch_size,
+                delay_spread=tf.random.uniform(
+                    shape=(),
+                    minval=self._delay_spread_min,
+                    maxval=self._delay_spread_max,
+                    dtype=tf.float32
+                ) * 1e-9  # nano Seconds
+            )
+            for gen in self._gens
+        ]
+
+        # Step 2: Stack outputs into a tensor
+        all_outputs = tf.stack(outputs, axis=0)
+
+        # Step 3: Shuffle indices
+        indices = tf.range(k)
+        shuffled_indices = tf.random.shuffle(indices)
+
+        # Step 4: Select first n indices
+        selected_indices = shuffled_indices[:num_tx]
+
+        # Step 5: Gather selected outputs
+        selected_outputs = tf.gather(all_outputs, selected_indices, axis=0)
+
+        # Step 6: Unstack into a list
+        h_list = tf.unstack(selected_outputs, axis=0)
+
+        h = tf.concat(h_list, axis=3)
+        y = self._apply_channel([x, h, no])
+        # print(f"[tdl call]h:{tf.shape(h)}, y:{tf.shape(y)}, x:{x.shape}")
+        return y, h
+
+
+
+
+
+
+
+
+
+#
+# SPDX-FileCopyrightText: Copyright (c) 2021-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+"""Class for generating channel frequency responses"""
+
+
+from sionna.channel.utils import subcarrier_frequencies, cir_to_ofdm_channel
+class GenerateOFDMChannel_:
+    # pylint: disable=line-too-long
+    r"""GenerateOFDMChannel(channel_model, resource_grid, normalize_channel=False)
+
+    Generate channel frequency responses.
+    The channel impulse response is constant over the duration of an OFDM symbol.
+
+    Given a channel impulse response
+    :math:`(a_{m}(t), \tau_{m}), 0 \leq m \leq M-1`, generated by the ``channel_model``,
+    the channel frequency response for the :math:`s^{th}` OFDM symbol and
+    :math:`n^{th}` subcarrier is computed as follows:
+
+    .. math::
+        \widehat{h}_{s, n} = \sum_{m=0}^{M-1} a_{m}(s) e^{-j2\pi n \Delta_f \tau_{m}}
+
+    where :math:`\Delta_f` is the subcarrier spacing, and :math:`s` is used as time
+    step to indicate that the channel impulse response can change from one OFDM symbol to the
+    next in the event of mobility, even if it is assumed static over the duration
+    of an OFDM symbol.
+
+    Parameters
+    ----------
+    channel_model : :class:`~sionna.channel.ChannelModel` object
+        An instance of a :class:`~sionna.channel.ChannelModel` object, such as
+        :class:`~sionna.channel.RayleighBlockFading` or
+        :class:`~sionna.channel.tr38901.UMi`.
+
+    resource_grid : :class:`~sionna.ofdm.ResourceGrid`
+        Resource grid
+
+    normalize_channel : bool
+        If set to `True`, the channel is normalized over the resource grid
+        to ensure unit average energy per resource element. Defaults to `False`.
+
+    dtype : tf.DType
+        Complex datatype to use for internal processing and output.
+        Defaults to `tf.complex64`.
+
+    Input
+    -----
+
+    batch_size : int
+        Batch size. Defaults to `None` for channel models that do not require this paranmeter.
+
+    Output
+    -------
+    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_subcarriers], tf.complex
+        Channel frequency responses
+    """
+
+    def __init__(self, channel_model, resource_grid, normalize_channel=False,
+                 dtype=tf.complex64):
+
+        # Callable used to sample channel input responses
+        self._cir_sampler = channel_model
+
+        # We need those in call()
+        self._num_ofdm_symbols = resource_grid.num_ofdm_symbols
+        self._subcarrier_spacing = resource_grid.subcarrier_spacing
+        self._num_subcarriers = resource_grid.fft_size
+        self._normalize_channel = normalize_channel
+        self._sampling_frequency = 1./resource_grid.ofdm_symbol_duration
+
+        # Frequencies of the subcarriers
+        self._frequencies = subcarrier_frequencies(self._num_subcarriers,
+                                                   self._subcarrier_spacing,
+                                                   dtype)
+
+    def __call__(self, batch_size=None, delay_spread=None):
+
+        # Sample channel impulse responses
+        h, tau = self._cir_sampler( batch_size,
+                                    self._num_ofdm_symbols,
+                                    self._sampling_frequency,
+                                    delay_spread)
+
+        h_freq = cir_to_ofdm_channel(self._frequencies, h, tau,
+                                     self._normalize_channel)
+
+        return h_freq
+
+
+
 
 class DoubleTDLChannel(tf.keras.layers.Layer):
     """
@@ -106,8 +408,11 @@ class DoubleTDLChannel(tf.keras.layers.Layer):
             alpha = 0.9
             beta = 0.9
 
-        tx_corr_mat = ue_correlation_matrix(num_tx_ant, beta)
-        rx_corr_mat = gnb_correlation_matrix(num_rx_ant, alpha)
+        # tx_corr_mat = ue_correlation_matrix(num_tx_ant, beta)
+        # rx_corr_mat = gnb_correlation_matrix(num_rx_ant, alpha)
+
+        tx_corr_mat = exp_corr_mat(beta, num_tx_ant)
+        rx_corr_mat = exp_corr_mat(alpha, num_rx_ant)
 
         # TDL B100 model
         delay_spread_1 = 100e-9
@@ -139,9 +444,8 @@ class DoubleTDLChannel(tf.keras.layers.Layer):
                                         tdl1,
                                         resource_grid,
                                         normalize_channel=norm_channel)
-
         self._gen_channel_2 = GenerateOFDMChannel(
-                                        tdl2,
+                                        tdl2,#2
                                         resource_grid,
                                         normalize_channel=norm_channel)
 
@@ -319,3 +623,291 @@ class DatasetChannel(ChannelModel):
                     perm=[1,0,2,3])
 
         return a, tau
+
+
+
+import h5py
+import numpy as np
+import tensorflow as tf
+
+class OFDMDatasetChannelSampler(ChannelModel):
+    """Channel model from a MATLAB v7.3 file containing precomputed OFDM channels.
+
+    The entire dataset is read into memory once during initialization.
+
+    Expected dataset format in the MAT-file
+    ---------------------------------------
+    h_freq : complex tensor with shape
+        [num_examples, num_rx, num_rx_ant, num_tx, num_tx_ant,
+         num_ofdm_symbols, fft_size]
+
+    Notes
+    -----
+    - MATLAB v7.3 files are HDF5-based, so they are read with ``h5py``.
+    - The runtime sampling path in ``__call__`` is TensorFlow graph compatible.
+    - This class returns OFDM frequency-domain channels directly, not ``a`` and ``tau``.
+    """
+
+    def __init__(self,
+                 mat_filename,
+                 max_num_examples=-1,
+                 training=True,
+                 num_tx=1,
+                 random_subsampling=True,
+                 dataset_name="h_freq",
+                 dtype=tf.complex64):
+        self._training = training
+        self._num_tx = num_tx
+        self._random_subsampling = random_subsampling
+        self._dtype = dtype
+
+        h_freq = self._load_mat_v73_complex(dataset_name=dataset_name,
+                                            mat_filename=mat_filename,
+                                            max_num_examples=max_num_examples)
+
+        # Ensure dtype expected by the simulator
+        h_freq = tf.cast(h_freq, self._dtype)
+
+        # h_freq shape:
+        # [N, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+        if training:
+            # Same partitioning logic as the original code:
+            # split dataset into equal subsets, one subset per user stream.
+            num_examples = int(h_freq.shape[0] // self._num_tx)
+            self._num_examples = num_examples
+            self._h = []
+            for i in range(self._num_tx):
+                self._h.append(h_freq[i*num_examples:(i+1)*num_examples])
+        else:
+            self._num_examples = int(h_freq.shape[0])
+            self._h = [h_freq]
+
+    @staticmethod
+    def _load_mat_v73_complex(mat_filename, dataset_name="h_freq", max_num_examples=-1):
+        """Load a complex OFDM channel tensor from a MATLAB v7.3 MAT-file.
+
+        Returns
+        -------
+        tf.Tensor
+            Tensor of shape
+            [num_examples, num_rx, num_rx_ant, num_tx, num_tx_ant,
+            num_ofdm_symbols, fft_size]
+        """
+        with h5py.File(mat_filename, "r") as f:
+            if dataset_name not in f:
+                raise KeyError(f"Dataset '{dataset_name}' not found in '{mat_filename}'")
+
+            ds = f[dataset_name]
+            arr = ds[()]
+
+        if np.iscomplexobj(arr):
+            h = arr
+        elif arr.dtype.fields is not None:
+            fields = set(arr.dtype.fields.keys())
+            if {"real", "imag"}.issubset(fields):
+                h = arr["real"] + 1j * arr["imag"]
+            elif {"r", "i"}.issubset(fields):
+                h = arr["r"] + 1j * arr["i"]
+            else:
+                raise ValueError(
+                    f"Unsupported complex compound dtype fields: {list(fields)}"
+                )
+        else:
+            raise ValueError(
+                "Dataset is not complex. Expected MATLAB complex data for 'h_freq'."
+            )
+
+        # MATLAB v7.3/HDF5 dimension order appears reversed in h5py.
+        # Read shape example:
+        #   (fft_size, num_sym, num_tx_ant, num_tx, num_rx_ant, num_rx, batch)
+        # Convert to:
+        #   (batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft_size)
+        if h.ndim != 7:
+            raise ValueError(f"Expected 7-D tensor for '{dataset_name}', got shape {h.shape}")
+
+        h = np.transpose(h, (6, 5, 4, 3, 2, 1, 0))
+
+        if max_num_examples != -1:
+            h = h[:max_num_examples]
+
+        h = tf.convert_to_tensor(h, dtype=tf.complex64)
+        # tattle(h, 5, ("h"))
+
+        return h
+
+    def __call__(self,
+                 batch_size=None,
+                 num_time_steps=None,
+                 sampling_frequency=None):
+        # Unused arguments kept for compatibility with existing interfaces.
+        del num_time_steps
+        del sampling_frequency
+
+        if batch_size is None:
+            raise ValueError("batch_size must be provided.")
+
+        if self._training:
+            h = None
+
+            if not self._random_subsampling:
+                ind = tf.random.uniform([batch_size],
+                                        maxval=self._num_examples,
+                                        dtype=tf.int32)
+
+            # Randomly subsample from different subsets
+            for ue_idx in range(self._num_tx):
+                if self._random_subsampling:
+                    ind = tf.random.uniform([batch_size],
+                                            maxval=self._num_examples,
+                                            dtype=tf.int32)
+
+                # self._h[ue_idx]:
+                # [Nsub, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft]
+                h_ = tf.gather(self._h[ue_idx], ind, axis=0)
+                # h_:
+                # [batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft]
+
+                if h is not None:
+                    # Aggregate sampled users along num_tx axis
+                    h = tf.concat([h, h_], axis=3)
+                else:
+                    h = h_
+        else:
+            # Evaluation mode: keep the original "alternating users" idea.
+            if not self._random_subsampling:
+                ind = tf.random.uniform([batch_size],
+                                        maxval=self._num_examples // self._num_tx,
+                                        dtype=tf.int32)
+                ind = tf.repeat(tf.expand_dims(ind, axis=-1),
+                                repeats=self._num_tx,
+                                axis=-1)
+            else:
+                ind = tf.random.uniform([batch_size, self._num_tx],
+                                        maxval=self._num_examples // self._num_tx,
+                                        dtype=tf.int32)
+
+            ind = self._num_tx * ind + tf.expand_dims(
+                tf.range(self._num_tx, dtype=tf.int32), axis=0
+            )
+
+            # self._h[0]:
+            # [N, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft]
+            h = tf.gather(self._h[0], ind, axis=0)
+            # h:
+            # [batch, num_tx_users, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft]
+
+            # Merge gathered user dimension into num_tx
+            b = tf.shape(h)[0]
+            n_users = tf.shape(h)[1]
+            num_rx = tf.shape(h)[2]
+            num_rx_ant = tf.shape(h)[3]
+            num_tx = tf.shape(h)[4]
+            num_tx_ant = tf.shape(h)[5]
+            num_sym = tf.shape(h)[6]
+            fft_size = tf.shape(h)[7]
+
+            h = tf.transpose(h, [0, 2, 3, 1, 4, 5, 6, 7])
+            h = tf.reshape(h, [b, num_rx, num_rx_ant,
+                               n_users * num_tx, num_tx_ant,
+                               num_sym, fft_size])
+
+        return h
+
+# from .helpers import tattle
+
+class OFDMDatasetChannel(Layer):
+    """
+
+    Parameters
+    ----------
+    channel_model : :class:`~sionna.channel.ChannelModel` object
+        An instance of a :class:`~sionna.channel.ChannelModel` object, such as
+        :class:`~sionna.channel.RayleighBlockFading` or
+        :class:`~sionna.channel.tr38901.UMi`.
+
+    resource_grid : :class:`~sionna.ofdm.ResourceGrid`
+        Resource grid
+
+    add_awgn : bool
+        If set to `False`, no white Gaussian noise is added.
+        Defaults to `True`.
+
+    normalize_channel : bool
+        If set to `True`, the channel is normalized over the resource grid
+        to ensure unit average energy per resource element. Defaults to `False`.
+
+    return_channel : bool
+        If set to `True`, the channel response is returned in addition to the
+        channel output. Defaults to `False`.
+
+    dtype : tf.DType
+        Complex datatype to use for internal processing and output.
+        Defaults to tf.complex64.
+
+    Input
+    -----
+
+    (x, no) or x:
+        Tuple or Tensor:
+
+    x :  [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], tf.complex
+        Channel inputs
+
+    no : Scalar or Tensor, tf.float
+        Scalar or tensor whose shape can be broadcast to the shape of the
+        channel outputs:
+        [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size].
+        Only required if ``add_awgn`` is set to `True`.
+        The noise power ``no`` is per complex dimension. If ``no`` is a scalar,
+        noise of the same variance will be added to the outputs.
+        If ``no`` is a tensor, it must have a shape that can be broadcast to
+        the shape of the channel outputs. This allows, e.g., adding noise of
+        different variance to each example in a batch. If ``no`` has a lower
+        rank than the channel outputs, then ``no`` will be broadcast to the
+        shape of the channel outputs by adding dummy dimensions after the last
+        axis.
+
+    Output
+    -------
+    y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], tf.complex
+        Channel outputs
+    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size], tf.complex
+        (Optional) Channel frequency responses. Returned only if
+        ``return_channel`` is set to `True`.
+    """
+
+    def __init__(self, channel_model, add_awgn=True,
+                normalize_channel=False, return_channel=False,
+                dtype=tf.complex64, **kwargs):
+        super().__init__(trainable=False, dtype=dtype, **kwargs)
+
+        self._channel_sampler = channel_model
+        self._add_awgn = add_awgn
+        self._normalize_channel = normalize_channel
+        self._return_channel = return_channel
+
+    def build(self, input_shape): #pylint: disable=unused-argument
+
+        self._apply_channel = ApplyOFDMChannel( self._add_awgn,
+                                                tf.as_dtype(self.dtype))
+
+    def call(self, inputs):
+
+        if self._add_awgn:
+            x, no = inputs
+        else:
+            x = inputs
+
+        h_freq = self._channel_sampler(tf.shape(x)[0])
+
+        # tattle((x,h_freq),3, ("x","h_freq"))
+
+        if self._add_awgn:
+            y = self._apply_channel([x, h_freq, no])
+        else:
+            y = self._apply_channel([x, h_freq])
+
+        if self._return_channel:
+            return y, h_freq
+        else:
+            return y

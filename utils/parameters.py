@@ -10,6 +10,8 @@
 
 # reads in the configuration file and initialized all relevant system components
 # This allows to train and evaluate different system configurations on the same # server and simplifies logging of the training process.
+import core.runtime as _runtime
+import os
 
 import numpy as np
 import configparser
@@ -19,7 +21,7 @@ from sionna.nr import PUSCHConfig, PUSCHDMRSConfig, TBConfig, CarrierConfig, PUS
 from sionna.channel.tr38901 import PanelArray, UMi, TDL, UMa
 from sionna.mimo import StreamManagement
 from sionna.channel import OFDMChannel, AWGN
-from .channel_models import DoubleTDLChannel, DatasetChannel
+from .channel_models import DoubleTDLChannel, DatasetChannel, NTDLChannel, OFDMDatasetChannel, OFDMDatasetChannelSampler
 from .impairments import FrequencyOffset
 
 class Parameters:
@@ -33,11 +35,16 @@ class Parameters:
 
     system : str
         Receiver algorithm to be used.Must be one of:
+        * "deep_echo" : Multi-path component estimation algorithm
+        * "deep_echo_kbest" : DeepEcho channel refinement with K-Best detection
+        * "mdx" : Model driven
         * "nrx" : Neural receiver
+        * "nrx_kbest" : Neural receiver channel refinement with K-Best detection
         * "baseline_lmmse_kbest" : LMMSE estimation and K-Best detection
         * "baseline_perf_csi_kbest" : perfect CSI and K-Best detection
         * "baseline_lmmse_lmmse" : LMMSE estimation and LMMSE equalization
         * "baseline_lsnn_lmmse" : LS estimation/nn interpolation and LMMSE equalization
+        * "baseline_lsnn_kbest" : LS estimation/nn interpolation and K-Best equalization
         * "dummy" : stops after parameter import. Can be used only to parse the
         config.
 
@@ -66,6 +73,7 @@ class Parameters:
         assert isinstance(compute_cov, bool), "compute_cov must be bool."
 
         self.system = system
+        self.config_name = config_name
 
         ###################################
         ##### Load configuration file #####
@@ -95,11 +103,62 @@ class Parameters:
                 if verbose:
                     print(s)
 
+
+       
+        self._training = training
+        self._verbose = verbose
+        self._compute_cov = compute_cov
+        self._num_tx_eval = num_tx_eval
+
+        if hasattr(self, "dtype"):
+            if not self.dtype.is_complex:
+                raise TypeError(f"Expected a complex dtype, but got {self.dtype.name}")
+            self.real_dtype = self.dtype.real_dtype
+
+        self.re_init(training, verbose, compute_cov, num_tx_eval)
+
+
+    def re_init(self,training=None, verbose=None, compute_cov=None, num_tx_eval=None,
+                n_size_bwp_eval=None, batch_size_eval=None, batch_size_eval_small=None,
+                max_ut_velocity_eval=None, min_ut_velocity_eval=None,
+                channel_norm_eval=None, mat_filename_eval=None,
+                channel_type_eval=None, tdl_models=None): # Just a fast solution
+
+
+
+        if training is None:
+            training = self._training
+        if verbose is None:
+            verbose = self._verbose
+        if compute_cov is None:
+            compute_cov = self._compute_cov
+        if num_tx_eval is None:
+            num_tx_eval = self._num_tx_eval
+
+        if n_size_bwp_eval is not None:
+            self.n_size_bwp_eval = n_size_bwp_eval
+        if batch_size_eval is not None:
+            self.batch_size_eval = batch_size_eval
+        if batch_size_eval_small is not None:
+            self.batch_size_eval_small = batch_size_eval_small            
+        if max_ut_velocity_eval is not None:
+            self.max_ut_velocity_eval = max_ut_velocity_eval
+        if min_ut_velocity_eval is not None:
+            self.min_ut_velocity_eval = min_ut_velocity_eval
+        if channel_norm_eval is not None:
+            self.channel_norm_eval = channel_norm_eval
+
+
         # Overwrite channel and PRBs in inference mode with "eval" parameters
         # This allows to configure different parameters during training and
         # evaluation.
+
+
+
         if not training:
-            self.channel_type = self.channel_type_eval
+            # self.channel_type = channel_type_eval
+            if hasattr(self, 'mat_filename') and mat_filename_eval is not None:
+                self.mat_filename = mat_filename_eval
             self.n_size_bwp = self.n_size_bwp_eval
             self.max_ut_velocity = self.max_ut_velocity_eval
             self.min_ut_velocity = self.min_ut_velocity_eval
@@ -150,18 +209,29 @@ class Parameters:
                     mcs_table=self.mcs_table,
                     channel_type="PUSCH")
                     #n_id=self.n_ids[0])
-
-            # first user PUSCH config
-            pc = PUSCHConfig(
-                    carrier_config=carrier_config,
-                    pusch_dmrs_config=pusch_dmrs_config,
-                    tb_config=tb_config,
-                    num_antenna_ports = self.num_antenna_ports,
-                    precoding = self.precoding,
-                    symbol_allocation = self.symbol_allocation,
-                    tpmi = self.tpmi,
-                    mapping_type=self.dmrs_mapping_type,)
-
+            if self.num_antenna_ports >1:
+                # first user PUSCH config
+                pc = PUSCHConfig(
+                        carrier_config=carrier_config,
+                        pusch_dmrs_config=pusch_dmrs_config,
+                        tb_config=tb_config,
+                        num_antenna_ports = self.num_antenna_ports,
+                        precoding = self.precoding,
+                        symbol_allocation = self.symbol_allocation,
+                        tpmi = self.tpmi,
+                        mapping_type=self.dmrs_mapping_type,)
+            else:
+                # first user PUSCH config
+                pc = PUSCHConfig(
+                        carrier_config=carrier_config,
+                        pusch_dmrs_config=pusch_dmrs_config,
+                        tb_config=tb_config,
+                        num_antenna_ports = self.num_antenna_ports,
+                        # precoding = self.precoding,
+                        symbol_allocation = self.symbol_allocation,
+                        # tpmi = self.tpmi,
+                        mapping_type=self.dmrs_mapping_type,)
+                        
             # clone new PUSCHConfig for each additional user
             for idx,_ in enumerate(self.dmrs_port_sets):
                 p = pc.clone() # generate new PUSCHConfig
@@ -169,9 +239,9 @@ class Parameters:
                 p.dmrs.dmrs_port_set = self.dmrs_port_sets[idx]
                 # The following parameters are derived from default.
                 # Comment lines if specific configuration is not required.
-                p.n_id = self.n_ids[idx]
-                p.dmrs.n_id = self.dmrs_nid[idx]
-                p.n_rnti = self.n_rntis[idx]
+                # p.n_id = self.n_ids[idx]
+                # p.dmrs.n_id = self.dmrs_nid[idx]
+                # p.n_rnti = self.n_rntis[idx]
                 self.pusch_configs[mcs_list_idx].append(p)
 
         ##############################
@@ -243,146 +313,25 @@ class Parameters:
         # StreamManagement required for KBestDetector
         self.sm = StreamManagement(np.ones([1, self.max_num_tx], int), 1)
 
-        ##############################
-        ##### Initialize Channel #####
-        ##############################
+        num_mcs = len(mcs_list)
+        self.points_list = [self.transmitters[i]._mapper.constellation.points for i in range(num_mcs)]  # List of tensors for each transmitter's points
 
-        # always use UMi to calculate covariance matrix
-        if compute_cov:
-            if not self.channel_type in ("UMi", "UMa"): # use UMa if selected
-                print("Setting channel type to UMi for covariance computation.")
-                self.channel_type = "UMi"
+        # ##############################
+        # ##### Initialize Channel #####
+        # ##############################
+        self.tdl_models = ["A"]
+        self._pc = pc
 
-        # Sanity check
-        if self.channel_type in ("DoubleTDLlow","DoubleTDLmedium",
-                                 "DoubleTDLhigh") and self.max_num_tx==1:
-                print("Warning: SelectedDoubleTDL model only defined for 2 "\
-                      "users. Selecting TDL-B100 instead.")
-                self.channel_type = "TDL-B100"
+        
 
-        # Initialize channel
-        # Remark: new channel models can be added here
-        if self.channel_type in ("UMi", "UMa"):
-            if self.num_rx_antennas==1: # ignore polarization for single antenna
-                print("Using vertical polarization for single antenna setup.")
-                num_cols_per_panel = 1
-                num_rows_per_panel = 1
-                polarization = "single"
-                polarization_type = 'V'
-            else:
-                # we use a ULA array to be aligned with TDL models
-                num_cols_per_panel = self.num_rx_antennas//2
-                num_rows_per_panel = 1
-                polarization = "dual"
-                polarization_type = 'cross'
-
-            bs_array = PanelArray(num_rows_per_panel = num_rows_per_panel,
-                                  num_cols_per_panel = num_cols_per_panel,
-                                  polarization = polarization,
-                                  polarization_type  = polarization_type,
-                                  antenna_pattern = '38.901',
-                                  carrier_frequency = self.carrier_frequency)
-
-            ut_array = PanelArray(num_rows_per_panel = 1,
-                                  num_cols_per_panel = pc.num_antenna_ports,
-                                  polarization = 'single',
-                                  polarization_type = 'V',
-                                  antenna_pattern = 'omni',
-                                  carrier_frequency = self.carrier_frequency)
-
-            if self.channel_type == "UMi":
-                self.channel_model = UMi(
-                                carrier_frequency=self.carrier_frequency,
-                                o2i_model = 'low',
-                                bs_array = bs_array,
-                                ut_array = ut_array,
-                                direction = 'uplink',
-                                enable_pathloss = False,
-                                enable_shadow_fading = False)
-            else: # UMa
-                self.channel_model = UMa(
-                                carrier_frequency=self.carrier_frequency,
-                                o2i_model = 'low',
-                                bs_array = bs_array,
-                                ut_array = ut_array,
-                                direction = 'uplink',
-                                enable_pathloss = False,
-                                enable_shadow_fading = False)
-
-            self.channel = OFDMChannel(
-                    channel_model=self.channel_model,
-                    resource_grid=self.transmitters[0]._resource_grid,          # resource grid is independent of MCS
-                    add_awgn=True,
-                    normalize_channel=self.channel_norm,
-                    return_channel=True)
-
-        elif self.channel_type == "TDL-B100":
-            tdl = TDL(model="B100",
-                      delay_spread=100e-9,
-                      carrier_frequency=self.carrier_frequency,
-                      min_speed=self.min_ut_velocity,
-                      max_speed=self.max_ut_velocity,
-                      num_tx_ant=pc.num_antenna_ports,
-                      num_rx_ant=self.num_rx_antennas)
-            self.channel = OFDMChannel(tdl,
-                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
-                                       add_awgn=True,
-                                       normalize_channel=self.channel_norm,
-                                       return_channel=True)
-        elif self.channel_type == "TDL-C300":
-            tdl = TDL(model="C300",
-                      delay_spread=300e-9,
-                      carrier_frequency=self.carrier_frequency,
-                      min_speed=self.min_ut_velocity,
-                      max_speed=self.max_ut_velocity,
-                      num_tx_ant=pc.num_antenna_ports,
-                      num_rx_ant=self.num_rx_antennas)
-            self.channel = OFDMChannel(tdl,
-                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
-                                       add_awgn=True,
-                                       normalize_channel=self.channel_norm,
-                                       return_channel=True)
-        # DoubleTDL for evaluation
-        elif self.channel_type == "DoubleTDLlow":
-            self.channel = DoubleTDLChannel(self.carrier_frequency,
-                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
-                                    correlation="low",
-                                    num_tx_ant=pc.num_antenna_ports,
-                                    norm_channel=self.channel_norm)
-        # DoubleTDL for evaluation
-        elif self.channel_type == "DoubleTDLmedium":
-            self.channel= DoubleTDLChannel(self.carrier_frequency,
-                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
-                                    correlation="medium",
-                                    num_tx_ant=pc.num_antenna_ports,
-                                    norm_channel=self.channel_norm)
-        # DoubleTDL for evaluation
-        elif self.channel_type == "DoubleTDLhigh":
-            self.channel = DoubleTDLChannel(self.carrier_frequency,
-                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
-                                    correlation="high",
-                                    num_tx_ant=pc.num_antenna_ports,
-                                    norm_channel=self.channel_norm)
-
-        elif self.channel_type == "AWGN":
-            self.channel = AWGN()
-
-
-        elif self.channel_type == "Dataset":
-            channel_model = DatasetChannel("../data/" + self.tfrecord_filename,
-                                    max_num_examples=-1, # loads entire dataset
-                                    training=training,
-                                    num_tx=self.max_num_tx,
-                                    random_subsampling=self.random_subsampling,
-                                    )
-            self.channel = OFDMChannel(channel_model,
-                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
-                                       add_awgn=True,
-                                       normalize_channel=self.channel_norm,
-                                       return_channel=True)
-
+        if tdl_models is not None:
+            self.tdl_models = tdl_models
+        if channel_type_eval is not None:
+            self.initialize_channel(compute_cov=compute_cov, channel_type_eval=channel_type_eval,
+                                    tdl_models=tdl_models)
         else:
-            raise ValueError("Unknown Channel type.")
+            self.initialize_channel(compute_cov=compute_cov)
+
 
         # Hardware impairments
         if self.cfo_offset_ppm>0:
@@ -396,6 +345,40 @@ class Parameters:
         else:
             self.frequency_offset = None
 
+        ##############################
+        ##### Positional Encoding #####
+        ##############################
+
+        if hasattr(self, 'pe_type'):
+            if self.system=="mdx":
+                if self.pe_type == 0: # NRX default
+                    self.pe_d = 2
+                if self.pe_type == 1: # sin coding
+                    seq_len = 12*14
+                    d = self.pe_d
+                    n = self.pe_n
+
+                    PE = np.zeros((seq_len, d))
+                    for k in range(seq_len):
+                        for i in np.arange(int(d/2)):
+                            denominator = np.power(n, 2*i/d)
+                            PE[k, 2*i] = np.sin(k/denominator)
+                            PE[k, 2*i+1] = np.cos(k/denominator)
+                    
+                    PE = tf.convert_to_tensor(PE, dtype=tf.float32)
+                    self.PE = tf.reshape(PE,[12,14,d])
+                if self.pe_type==2 or self.pe_type==3: # PRB coding or NRX default + PRB coding
+                    rows = tf.cast(tf.range(12, dtype=tf.float32) / 11.0, dtype=tf.float32)  # 0 to 11, normalized to [0, 1]
+                    cols = tf.cast(tf.range(14, dtype=tf.float32) / 13.0, dtype=tf.float32)  # 0 to 13, normalized to [0, 1]
+
+                    A_0 = tf.tile(tf.expand_dims(rows, axis=1), [1, 14])  
+                    A_1 = tf.tile(tf.expand_dims(cols, axis=0), [12, 1]) 
+
+                    # pe [12, 14, 2]
+                    self.PE = tf.stack([A_0, A_1], axis=-1)
+                    self.pe_d = 2
+                if self.pe_type==3: # NRX default + PRB coding
+                    self.pe_d = self.pe_d + 2
 
         ################
         ##### MISC #####
@@ -419,3 +402,234 @@ class Parameters:
             self.freq_cov_mat = tf.cast(np.load(
                         f'../weights/{self.label}_freq_cov_mat.npy'),
                                             tf.complex64)
+        
+    def initialize_channel(self,channel_type_eval=None, tdl_models=None, compute_cov=False,
+                                delay_spread_min=10,   # in nano seconds
+                                delay_spread_max=300,  # in nano seconds
+                                doppler_shift_max=325  # Hz
+                                ):
+
+      
+        ##############################
+        ##### Initialize Channel #####
+        ##############################
+
+        # Enable/Disable random number of clusters for geometric channel models (implemented only for UMi)
+        if hasattr(self, 'random_num_clusters'):
+            random_num_clusters = self.random_num_clusters
+        else:
+            random_num_clusters = False
+
+        # Enable/Disable random number of rays for geometric channel models (implemented only for UMi)
+        if hasattr(self, 'random_num_rays'):
+            random_num_rays = self.random_num_rays
+        else:
+            random_num_rays = False
+
+        if hasattr(self, 'mask_doa'):
+            mask_doa = self.mask_doa
+        else:
+            mask_doa = False        
+
+        if hasattr(self, 'num_rays'):
+            num_rays = self.num_rays
+        else:
+            num_rays = None       
+
+
+        if channel_type_eval is not None:
+            self.channel_type = channel_type_eval
+        if tdl_models is not None:
+            self.tdl_models = tdl_models
+        # always use UMi to calculate covariance matrix
+        if compute_cov:
+            # if not self.channel_type in ("UMi", "UMa", "OFDMDataset"): # use UMa if selected, use dataset if selected
+            if not self.channel_type in ("UMi", "UMa"): # use UMa if selected, use dataset if selected
+                print("Setting channel type to UMi for covariance computation.")
+                self.channel_type = "UMi"
+
+        # Sanity check
+        if self.channel_type in ("DoubleTDLlow","DoubleTDLmedium",
+                                 "DoubleTDLhigh") and self.max_num_tx==1:
+                print("Warning: SelectedDoubleTDL model only defined for 2 "\
+                      "users. Selecting TDL-B100 instead.")
+                self.channel_type = "TDL-B100"
+
+        # Initialize channel
+        # Remark: new channel models can be added here
+
+        if self.channel_type in ("UMi", "UMa"):
+            if self.num_rx_antennas==1: # ignore polarization for single antenna
+                print("Using vertical polarization for single antenna setup.")
+                num_cols_per_panel = 1
+                num_rows_per_panel = 1
+                polarization = "single"
+                polarization_type = 'V'
+            else:
+
+                if hasattr(self, 'num_cols_per_panel') and hasattr(self, 'num_rows_per_panel'):
+                    num_cols_per_panel = self.num_cols_per_panel
+                    num_rows_per_panel = self.num_rows_per_panel
+                    assert num_cols_per_panel * num_rows_per_panel * 2 == self.num_rx_antennas, \
+        f"Invalid antenna configuration: {num_cols_per_panel} columns * {num_rows_per_panel} rows * 2 " \
+        f"does not equal {self.num_rx_antennas} receive antennas"
+                else:
+                    # we use a ULA array to be aligned with TDL models
+                    num_cols_per_panel = self.num_rx_antennas//2
+                    num_rows_per_panel = 1
+                    
+                polarization = "dual"
+                polarization_type = 'cross'
+
+
+            bs_array = PanelArray(num_rows_per_panel = num_rows_per_panel,
+                                  num_cols_per_panel = num_cols_per_panel,
+                                  polarization = polarization,
+                                  polarization_type  = polarization_type,
+                                  antenna_pattern = '38.901',
+                                  carrier_frequency = self.carrier_frequency)
+
+            ut_array = PanelArray(num_rows_per_panel = 1,
+                                  num_cols_per_panel = self._pc.num_antenna_ports,
+                                  polarization = 'single',
+                                  polarization_type = 'V',
+                                  antenna_pattern = 'omni',
+                                  carrier_frequency = self.carrier_frequency)
+
+            if self.channel_type == "UMi":
+                self.channel_model = UMi(
+                                carrier_frequency=self.carrier_frequency,
+                                o2i_model = 'low',
+                                bs_array = bs_array,
+                                ut_array = ut_array,
+                                direction = 'uplink',
+                                enable_pathloss = False,
+                                enable_shadow_fading = False,
+                                random_num_clusters = random_num_clusters,
+                                random_num_rays = random_num_rays,
+                                mask_doa = mask_doa,
+                                num_rays = num_rays)
+            else: # UMa
+                self.channel_model = UMa(
+                                carrier_frequency=self.carrier_frequency,
+                                o2i_model = 'low',
+                                bs_array = bs_array,
+                                ut_array = ut_array,
+                                direction = 'uplink',
+                                enable_pathloss = False,
+                                enable_shadow_fading = False)
+
+            self.channel = OFDMChannel(
+                    channel_model=self.channel_model,
+                    resource_grid=self.transmitters[0]._resource_grid,          # resource grid is independent of MCS
+                    add_awgn=True,
+                    normalize_channel=self.channel_norm,
+                    return_channel=True)
+
+        elif self.channel_type == "TDL-B100":
+            tdl = TDL(model="B100",
+                      delay_spread=100e-9,
+                      carrier_frequency=self.carrier_frequency,
+                      min_speed=self.min_ut_velocity,
+                      max_speed=self.max_ut_velocity,
+                      num_tx_ant=self._pc.num_antenna_ports,
+                      num_rx_ant=self.num_rx_antennas)
+            self.channel = OFDMChannel(tdl,
+                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
+                                       add_awgn=True,
+                                       normalize_channel=self.channel_norm,
+                                       return_channel=True)
+        elif self.channel_type == "TDL-C300":
+            tdl = TDL(model="C300",
+                      delay_spread=300e-9,
+                      carrier_frequency=self.carrier_frequency,
+                      min_speed=self.min_ut_velocity,
+                      max_speed=self.max_ut_velocity,
+                      num_tx_ant=self._pc.num_antenna_ports,
+                      num_rx_ant=self.num_rx_antennas)
+            self.channel = OFDMChannel(tdl,
+                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
+                                       add_awgn=True,
+                                       normalize_channel=self.channel_norm,
+                                       return_channel=True)
+        # DoubleTDL for evaluation
+        elif self.channel_type == "DoubleTDLlow":
+            self.channel = DoubleTDLChannel(self.carrier_frequency,
+                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
+                                    correlation="low",
+                                    num_tx_ant=self._pc.num_antenna_ports,
+                                    num_rx_ant = self.num_rx_antennas,
+                                    norm_channel=self.channel_norm)
+        # DoubleTDL for evaluation
+        elif self.channel_type == "DoubleTDLmedium":
+            self.channel= DoubleTDLChannel(self.carrier_frequency,
+                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
+                                    correlation="medium",
+                                    num_tx_ant=self._pc.num_antenna_ports,
+                                    norm_channel=self.channel_norm)
+        # DoubleTDL for evaluation
+        elif self.channel_type == "DoubleTDLhigh":
+            self.channel = DoubleTDLChannel(self.carrier_frequency,
+                                    self.transmitters[0].resource_grid,         # resource grid is independent of MCS
+                                    correlation="high",
+                                    num_tx_ant=self._pc.num_antenna_ports,
+                                    norm_channel=self.channel_norm)
+        # NTDL for evaluation
+        elif self.channel_type == "NTDLlow":
+            # tdl_models=["A"]
+            # if hasattr(self, 'tdl_models'):
+            #     tdl_models = self.tdl_models
+            self.channel = NTDLChannel(carrier_frequency=self.carrier_frequency,
+                                    resource_grid=self.transmitters[0].resource_grid,        # resource grid is independent of MCS
+                                    correlation="low",
+                                    num_tx_ant=self._pc.num_antenna_ports,
+                                    num_rx_ant = self.num_rx_antennas,
+                                    max_num_tx = self.max_num_tx,
+                                    norm_channel=self.channel_norm,
+                                    tdl_models=self.tdl_models,
+                                    delay_spread_min=delay_spread_min,   # in nano seconds
+                                    delay_spread_max=delay_spread_max,  # in nano seconds
+                                    doppler_shift_max=doppler_shift_max  # Hz
+                                    )
+
+
+        elif self.channel_type == "AWGN":
+            self.channel = AWGN()
+
+
+        elif self.channel_type == "Dataset":
+            channel_model = DatasetChannel("../data/" + self.tfrecord_filename,
+                                    max_num_examples=-1, # loads entire dataset
+                                    training=self._training,
+                                    num_tx=self.max_num_tx,
+                                    random_subsampling=self.random_subsampling,
+                                    )
+            self.channel = OFDMChannel(channel_model,
+                                       self.transmitters[0].resource_grid,      # resource grid is independent of MCS
+                                       add_awgn=True,
+                                       normalize_channel=self.channel_norm,
+                                       return_channel=True)
+        elif self.channel_type == "OFDMDataset": #TODO 
+
+            file_path = os.path.join("..", "data", self.mat_filename)
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            self.channel_model = OFDMDatasetChannelSampler(file_path,
+                                    max_num_examples=-1, # loads entire dataset
+                                    training=self._training,
+                                    num_tx=self.max_num_tx,
+                                    random_subsampling=False,
+                                    )
+
+            self.channel = OFDMDatasetChannel(self.channel_model,
+                                    #    self.transmitters[0].resource_grid,      # resource grid is independent of MCS
+                                       add_awgn=True,
+                                       normalize_channel=self.channel_norm,
+                                       return_channel=True)
+
+            print(f"channel type reinit:{self.channel_type}, training:{self._training}, self.mat_filename:{self.mat_filename}" )
+
+
+        else:
+            raise ValueError("Unknown Channel type.")

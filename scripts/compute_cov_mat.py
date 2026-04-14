@@ -27,6 +27,7 @@ parser.add_argument("-num_samples", help="Number of samples",
 parser.add_argument("-gpu", help="GPU to use", type=int, default=0)
 parser.add_argument("-num_tx_eval", help="Number of active users",
                     type=int, default=1)
+parser.add_argument("-n_size_bwp_eval", type=int, default=132)
 
 # Parse all arguments
 args = parser.parse_args()
@@ -38,28 +39,34 @@ num_tx_eval = args.num_tx_eval
 ####################################################################
 
 import os
+import sys
+
+script_dir = os.path.abspath(os.path.dirname(__file__))
+repo_root = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
+repo_scripts_dir = os.path.join(repo_root, "scripts")
+
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+
+# Preserve the path assumptions used throughout the repo utilities.
+os.chdir(repo_scripts_dir)
+
+import core.runtime as _runtime  # noqa: F401
+
 # Avoid warnings from TensorFlow
 os.environ["CUDA_VISIBLE_DEVICES"] = f"{args.gpu}"
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
 
-gpus = tf.config.list_physical_devices('GPU')
-try:
-    print('Only GPU number', args.gpu, 'used.')
-    tf.config.experimental.set_memory_growth(gpus[0], True)
-except RuntimeError as e:
-    print(e)
-
-import sys
-sys.path.append('../')
+tf.get_logger().setLevel("ERROR")
 
 import sionna as sn
-sn.Config.xla_compat = True
+
+sn.config.xla_compat = True
 from sionna.channel import GenerateOFDMChannel, gen_single_sector_topology
 
-from utils import Parameters
+from ext.neural_rx.utils.parameters import Parameters
 import numpy as np
 
 ##################################################################
@@ -68,107 +75,107 @@ import numpy as np
 parameters = Parameters(config_name,
                         training=False,
                         num_tx_eval=num_tx_eval,
-                        system='nrx',
-                        compute_cov=True) #load UMi channel in any case
+                        system="nrx",
+                        compute_cov=True)  # load UMi channel in any case
+parameters.re_init(n_size_bwp_eval=args.n_size_bwp_eval)
 
 batch_size = parameters.batch_size_eval
+if hasattr(parameters, "batch_size_cov"):
+    batch_size = parameters.batch_size_cov
+
 NUM_SAMPLES = args.num_samples
 # run multiple iterations to limit the batchsize/memory requirements
-NUM_IT = int((NUM_SAMPLES//batch_size)+1)
+NUM_IT = int((NUM_SAMPLES // batch_size) + 1)
 
-channel_model = parameters.channel_model
+channel_type = parameters.channel_type
+if parameters.channel_type == "OFDMDataset":
+    gen_ofdm_channel = parameters.channel_model
+else:
+    channel_model = parameters.channel_model
 
-# OFDM channel in frequency domain
-gen_ofdm_channel = GenerateOFDMChannel(
-                                    channel_model,
-                                    parameters.transmitters[0]._resource_grid,
-                                    normalize_channel=True)
+    # OFDM channel in frequency domain
+    gen_ofdm_channel = GenerateOFDMChannel(
+        channel_model,
+        parameters.transmitters[0]._resource_grid,
+        normalize_channel=True,
+    )
 
 #################################################################
 # Evaluate covariance matrices
 #################################################################
 
-# Function that generates a batch of channel samples.
-# A new topology is sampled for every batch and for every batch example.
+
 def sample_channel(batch_size):
-    # Sample a random network topology for each
-    # batch example
-    topology = gen_single_sector_topology(batch_size, 1, 'umi',
-                                    min_ut_velocity=parameters.min_ut_velocity,
-                                    max_ut_velocity=parameters.max_ut_velocity)
-    channel_model.set_topology(*topology)
+    # Sample a random network topology for each batch example
+    if parameters.channel_type in ("UMi", "UMa"):
+        topology = gen_single_sector_topology(
+            batch_size,
+            1,
+            "umi",
+            min_ut_velocity=parameters.min_ut_velocity,
+            max_ut_velocity=parameters.max_ut_velocity,
+        )
+        channel_model.set_topology(*topology)
 
     # Sample channel frequency response
     # [batch size, 1, num_rx_ant, 1, 1, num_ofdm_symbols, fft_size]
     h_freq = gen_ofdm_channel(batch_size)
     # [batch size, num_rx_ant, num_ofdm_symbols, fft_size]
-    h_freq = h_freq[:,0,:,0,0]
+    h_freq = h_freq[:, 0, :, 0, 0]
 
     return h_freq
 
-@tf.function(jit_compile=True) # No XLA for better precision
+
+@tf.function(jit_compile=True)  # No XLA for better precision
 def estimate_cov_mats(batch_size, num_it):
     rg = parameters.transmitters[0]._resource_grid
     freq_cov_mat = tf.zeros([rg.fft_size, rg.fft_size], tf.complex64)
     time_cov_mat = tf.zeros([rg.num_ofdm_symbols, rg.num_ofdm_symbols],
-                             tf.complex64)
+                            tf.complex64)
     space_cov_mat = tf.zeros([parameters.num_rx_antennas,
                               parameters.num_rx_antennas], tf.complex64)
 
     for _ in tf.range(num_it):
         # [batch size, num_rx_ant, num_ofdm_symbols, fft_size]
         h_samples = sample_channel(batch_size)
-        #
+
         # Frequency covariance matrix estimation
-        #
         # [batch size, num_rx_ant, fft_size, num_ofdm_symbols]
-        h_samples_ = tf.transpose(h_samples, [0,1,3,2])
+        h_samples_ = tf.transpose(h_samples, [0, 1, 3, 2])
         # [batch size, num_rx_ant, fft_size, fft_size]
         freq_cov_mat_ = tf.matmul(h_samples_, h_samples_, adjoint_b=True)
         # [fft_size, fft_size]
-        freq_cov_mat_ = tf.reduce_mean(freq_cov_mat_, axis=(0,1))
-        # [fft_size, fft_size]
+        freq_cov_mat_ = tf.reduce_mean(freq_cov_mat_, axis=(0, 1))
         freq_cov_mat += freq_cov_mat_
 
-        #
         # Time covariance matrix estimation
-        #
         # [batch size, num_rx_ant, num_ofdm_symbols, num_ofdm_symbols]
         time_cov_mat_ = tf.matmul(h_samples, h_samples, adjoint_b=True)
         # [num_ofdm_symbols, num_ofdm_symbols]
-        time_cov_mat_ = tf.reduce_mean(time_cov_mat_, axis=(0,1))
-        # [num_ofdm_symbols, num_ofdm_symbols]
+        time_cov_mat_ = tf.reduce_mean(time_cov_mat_, axis=(0, 1))
         time_cov_mat += time_cov_mat_
 
-        #
         # Spatial covariance matrix estimation
-        #
         # [batch size, num_ofdm_symbols, num_rx_ant, fft_size]
-        h_samples_ = tf.transpose(h_samples, [0,2,1,3])
+        h_samples_ = tf.transpose(h_samples, [0, 2, 1, 3])
         # [batch size, num_ofdm_symbols, num_rx_ant, num_rx_ant]
         space_cov_mat_ = tf.matmul(h_samples_, h_samples_, adjoint_b=True)
         # [num_rx_ant, num_rx_ant]
-        space_cov_mat_ = tf.reduce_mean(space_cov_mat_, axis=(0,1))
-        # [num_rx_ant, num_rx_ant]
+        space_cov_mat_ = tf.reduce_mean(space_cov_mat_, axis=(0, 1))
         space_cov_mat += space_cov_mat_
 
-    freq_cov_mat /= tf.complex(tf.cast(rg.num_ofdm_symbols*num_it, tf.float32),
-                               0.0)
-    time_cov_mat /= tf.complex(tf.cast(rg.fft_size*num_it, tf.float32), 0.0)
-    space_cov_mat /= tf.complex(tf.cast(rg.fft_size*num_it, tf.float32), 0.0)
+    freq_cov_mat /= tf.complex(tf.cast(rg.num_ofdm_symbols * num_it, tf.float32), 0.0)
+    time_cov_mat /= tf.complex(tf.cast(rg.fft_size * num_it, tf.float32), 0.0)
+    space_cov_mat /= tf.complex(tf.cast(rg.fft_size * num_it, tf.float32), 0.0)
     return freq_cov_mat, time_cov_mat, space_cov_mat
 
-#
-# Run estimation
-#
-freq_cov_mat, time_cov_mat, space_cov_mat = estimate_cov_mats(batch_size,
-                                                              NUM_IT)
+
+freq_cov_mat, time_cov_mat, space_cov_mat = estimate_cov_mats(batch_size, NUM_IT)
 freq_cov_mat = freq_cov_mat.numpy()
 time_cov_mat = time_cov_mat.numpy()
 space_cov_mat = space_cov_mat.numpy()
 
-# Saving covariance matrices
-# Save the time and frequency covariance matrices.
-np.save(f'../weights/{parameters.label}_freq_cov_mat', freq_cov_mat)
-np.save(f'../weights/{parameters.label}_time_cov_mat', time_cov_mat)
-np.save(f'../weights/{parameters.label}_space_cov_mat', space_cov_mat)
+# Save covariance matrices into the main repo weights directory.
+np.save(f"../weights/{parameters.label}_freq_cov_mat", freq_cov_mat)
+np.save(f"../weights/{parameters.label}_time_cov_mat", time_cov_mat)
+np.save(f"../weights/{parameters.label}_space_cov_mat", space_cov_mat)
