@@ -556,7 +556,7 @@ class E2E_Model(Model):
         h_perf = self._apply_precoding_effect(h)
 
         # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
-        h_perf = self._mask_active_dmrs_channels(h_perf)
+        h_perf = self._mask_active_dmrs_channels(h_perf, batch_size, num_tx, active_dmrs)
         ###################################
         # Receiver
         ###################################
