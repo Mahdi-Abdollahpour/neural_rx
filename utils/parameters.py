@@ -80,14 +80,32 @@ class Parameters:
         ###################################
 
         # create parser object and read config file
-        fn = f'../config/{config_name}'
-        if exists(fn):
-            config = configparser.RawConfigParser()
-            # automatically add fileformat if needed
-            config_name.replace(".cfg","") + ".cfg"
-            config.read(fn)
-        else:
-            raise FileNotFoundError("Unknown config file.")
+        config_names = [config_name]
+        if not config_name.endswith(".cfg"):
+            config_names.append(f"{config_name}.cfg")
+
+        repo_config_dir = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "..", "..", "config")
+        )
+
+        candidate_paths = []
+        for cfg_name in config_names:
+            if os.path.isabs(cfg_name):
+                candidate_paths.append(cfg_name)
+            else:
+                candidate_paths.append(cfg_name)
+                candidate_paths.append(os.path.join("..", "config", cfg_name))
+                candidate_paths.append(os.path.join(repo_config_dir, cfg_name))
+
+        fn = next((path for path in candidate_paths if exists(path)), None)
+        if fn is None:
+            raise FileNotFoundError(
+                f"Unknown config file '{config_name}'. Looked in '{repo_config_dir}'."
+            )
+
+        config = configparser.RawConfigParser()
+        config.read(fn)
+        self.config_path = os.path.abspath(fn)
 
         # and import all parameters as attributes
         self.config_str = ""
