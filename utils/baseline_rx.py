@@ -56,12 +56,26 @@ class BaselineReceiver(Layer):
 
     Output
     ------
+    If `return_tb_status` is `False`:
+
+    b_hat : [batch_size, num_tx, tb_size], tf.float32
+        The reconstructed payload bits of each transport block.
+
+    h_hat : [batch_size, num_rx, num_rx_ant, num_tx, num_streams,
+             num_ofdm_symbols, fft_size], tf.complex64
+        Channel estimate returned by the underlying Sionna `PUSCHReceiver`.
+
+    If `return_tb_status` is `True`:
+
     b_hat : [batch_size, num_tx, tb_size], tf.float32
         The reconstructed payload bits of each transport block.
 
     tb_crc_status : [batch_size, num_tx], tf.bool
-        Transport block CRC status. Only returned if `return_tb_status`
-        is `True`.
+        Transport block CRC status.
+
+    h_hat : [batch_size, num_rx, num_rx_ant, num_tx, num_streams,
+             num_ofdm_symbols, fft_size], tf.complex64
+        Channel estimate returned by the underlying Sionna `PUSCHReceiver`.
     """
 
     def __init__(self,
@@ -74,6 +88,42 @@ class BaselineReceiver(Layer):
         super().__init__(dtype=dtype, **kwargs)
         self._sys_parameters = sys_parameters
         self._return_tb_status = return_tb_status
+        self._transmitter = sys_parameters.transmitters[mcs_arr_eval_idx]
+        self._resource_grid = self._transmitter._resource_grid
+        self._rx_slot_shape = tf.TensorShape([
+            None,
+            1,
+            sys_parameters.num_rx_antennas,
+            self._resource_grid.num_ofdm_symbols,
+            self._resource_grid.fft_size,
+        ])
+        self._perfect_csi_shape = tf.TensorShape([
+            None,
+            1,
+            sys_parameters.num_rx_antennas,
+            sys_parameters.max_num_tx,
+            sys_parameters.num_antenna_ports,
+            self._resource_grid.num_ofdm_symbols,
+            self._resource_grid.fft_size,
+        ])
+        self._tb_shape = tf.TensorShape([
+            None,
+            sys_parameters.max_num_tx,
+            self._transmitter._tb_size,
+        ])
+        self._tb_crc_shape = tf.TensorShape([
+            None,
+            sys_parameters.max_num_tx,
+        ])
+        self._ch_est_shape = tf.TensorShape([
+            None,
+            1,
+            sys_parameters.num_rx_antennas,
+            sys_parameters.max_num_tx,
+            1,
+            self._resource_grid.num_ofdm_symbols,
+            self._resource_grid.fft_size,
+        ])
 
         ###################################
         # Channel Estimation
@@ -273,14 +323,25 @@ class BaselineReceiver(Layer):
         if self._sys_parameters.system in ("baseline_perf_csi_kbest",
                                            "baseline_perf_csi_lmmse"):
             y, h, no = inputs
-            b_hat = self._receiver([y, h, no])
+            y = tf.ensure_shape(y, self._rx_slot_shape)
+            h = tf.ensure_shape(h, self._perfect_csi_shape)
+            receiver_outputs = self._receiver([y, h, no])
         else:
             y, no = inputs
-            b_hat = self._receiver([y, no])
+            y = tf.ensure_shape(y, self._rx_slot_shape)
+            receiver_outputs = self._receiver([y, no])
 
-        # h_hat [batch size, num_rx, num_rx_ant, num_tx, num_streams,...
-        #  ...num_ofdm_symbols, fft_size]
-        return b_hat
+        if self._return_tb_status:
+            b_hat, tb_crc_status, h_hat = receiver_outputs
+            b_hat = tf.ensure_shape(b_hat, self._tb_shape)
+            tb_crc_status = tf.ensure_shape(tb_crc_status, self._tb_crc_shape)
+            h_hat = tf.ensure_shape(h_hat, self._ch_est_shape)
+            return b_hat, tb_crc_status, h_hat
+
+        b_hat, h_hat = receiver_outputs
+        b_hat = tf.ensure_shape(b_hat, self._tb_shape)
+        h_hat = tf.ensure_shape(h_hat, self._ch_est_shape)
+        return b_hat, h_hat
 
 # The following LMMSE estimator implementations are used to keep the
 # complexity of the LMMSEEstimator class feasible.

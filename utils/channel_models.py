@@ -624,14 +624,21 @@ class DatasetChannel(ChannelModel):
 
         return a, tau
 
+try:
+    import h5py
+except ImportError:
+    h5py = None
 
+try:
+    from scipy import io as scipy_io
+except ImportError:
+    scipy_io = None
 
-import h5py
 import numpy as np
 import tensorflow as tf
 
 class OFDMDatasetChannelSampler(ChannelModel):
-    """Channel model from a MATLAB v7.3 file containing precomputed OFDM channels.
+    """Channel model from a MATLAB file containing precomputed OFDM channels.
 
     The entire dataset is read into memory once during initialization.
 
@@ -643,7 +650,11 @@ class OFDMDatasetChannelSampler(ChannelModel):
 
     Notes
     -----
-    - MATLAB v7.3 files are HDF5-based, so they are read with ``h5py``.
+    - Standard MATLAB ``.mat`` files are read with ``scipy.io.loadmat``.
+    - MATLAB v7.3 / HDF5 files are read with ``h5py`` when available.
+    - HDF5-backed ``.mat`` files written by the DeepMIMO generator scripts carry a
+      ``codex_layout="sampler_direct"`` attribute and are read without the
+      legacy MATLAB v7.3 axis reversal.
     - The runtime sampling path in ``__call__`` is TensorFlow graph compatible.
     - This class returns OFDM frequency-domain channels directly, not ``a`` and ``tau``.
     """
@@ -661,9 +672,9 @@ class OFDMDatasetChannelSampler(ChannelModel):
         self._random_subsampling = random_subsampling
         self._dtype = dtype
 
-        h_freq = self._load_mat_v73_complex(dataset_name=dataset_name,
-                                            mat_filename=mat_filename,
-                                            max_num_examples=max_num_examples)
+        h_freq = self._load_mat_complex(dataset_name=dataset_name,
+                                        mat_filename=mat_filename,
+                                        max_num_examples=max_num_examples)
 
         # Ensure dtype expected by the simulator
         h_freq = tf.cast(h_freq, self._dtype)
@@ -683,8 +694,37 @@ class OFDMDatasetChannelSampler(ChannelModel):
             self._h = [h_freq]
 
     @staticmethod
-    def _load_mat_v73_complex(mat_filename, dataset_name="h_freq", max_num_examples=-1):
-        """Load a complex OFDM channel tensor from a MATLAB v7.3 MAT-file.
+    def _decode_complex_array(arr, dataset_name="h_freq"):
+        """Decode numeric or compound complex arrays into a complex numpy array."""
+        if np.iscomplexobj(arr):
+            return arr
+        if arr.dtype.fields is not None:
+            fields = set(arr.dtype.fields.keys())
+            if {"real", "imag"}.issubset(fields):
+                return arr["real"] + 1j * arr["imag"]
+            if {"r", "i"}.issubset(fields):
+                return arr["r"] + 1j * arr["i"]
+            raise ValueError(
+                f"Unsupported complex compound dtype fields for '{dataset_name}': {list(fields)}"
+            )
+        raise ValueError(
+            f"Dataset '{dataset_name}' is not complex."
+        )
+
+    @staticmethod
+    def _decode_hdf5_attr(value):
+        """Normalize HDF5 attribute values to plain Python strings when possible."""
+        if isinstance(value, np.ndarray) and value.shape == ():
+            value = value[()]
+        if isinstance(value, np.bytes_):
+            return value.decode()
+        if isinstance(value, bytes):
+            return value.decode()
+        return value
+
+    @classmethod
+    def _load_mat_complex(cls, mat_filename, dataset_name="h_freq", max_num_examples=-1):
+        """Load a complex OFDM channel tensor from MATLAB MAT files.
 
         Returns
         -------
@@ -693,47 +733,63 @@ class OFDMDatasetChannelSampler(ChannelModel):
             [num_examples, num_rx, num_rx_ant, num_tx, num_tx_ant,
             num_ofdm_symbols, fft_size]
         """
-        with h5py.File(mat_filename, "r") as f:
-            if dataset_name not in f:
-                raise KeyError(f"Dataset '{dataset_name}' not found in '{mat_filename}'")
+        errors = []
 
-            ds = f[dataset_name]
-            arr = ds[()]
+        if scipy_io is not None:
+            try:
+                mat = scipy_io.loadmat(mat_filename)
+                if dataset_name not in mat:
+                    raise KeyError(f"Dataset '{dataset_name}' not found in '{mat_filename}'")
+                h = cls._decode_complex_array(mat[dataset_name], dataset_name=dataset_name)
+                if h.ndim != 7:
+                    raise ValueError(
+                        f"Expected 7-D tensor for '{dataset_name}', got shape {h.shape}"
+                    )
+                if max_num_examples != -1:
+                    h = h[:max_num_examples]
+                return tf.convert_to_tensor(h, dtype=tf.complex64)
+            except Exception as exc:  # fallback to HDF5/v7.3 reader if needed
+                errors.append(exc)
 
-        if np.iscomplexobj(arr):
-            h = arr
-        elif arr.dtype.fields is not None:
-            fields = set(arr.dtype.fields.keys())
-            if {"real", "imag"}.issubset(fields):
-                h = arr["real"] + 1j * arr["imag"]
-            elif {"r", "i"}.issubset(fields):
-                h = arr["r"] + 1j * arr["i"]
-            else:
-                raise ValueError(
-                    f"Unsupported complex compound dtype fields: {list(fields)}"
-                )
-        else:
-            raise ValueError(
-                "Dataset is not complex. Expected MATLAB complex data for 'h_freq'."
-            )
+        if h5py is not None:
+            try:
+                with h5py.File(mat_filename, "r") as f:
+                    if dataset_name not in f:
+                        raise KeyError(f"Dataset '{dataset_name}' not found in '{mat_filename}'")
 
-        # MATLAB v7.3/HDF5 dimension order appears reversed in h5py.
-        # Read shape example:
-        #   (fft_size, num_sym, num_tx_ant, num_tx, num_rx_ant, num_rx, batch)
-        # Convert to:
-        #   (batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft_size)
-        if h.ndim != 7:
-            raise ValueError(f"Expected 7-D tensor for '{dataset_name}', got shape {h.shape}")
+                    ds = f[dataset_name]
+                    layout = cls._decode_hdf5_attr(ds.attrs.get("codex_layout"))
+                    arr = ds[()]
 
-        h = np.transpose(h, (6, 5, 4, 3, 2, 1, 0))
+                h = cls._decode_complex_array(arr, dataset_name=dataset_name)
 
-        if max_num_examples != -1:
-            h = h[:max_num_examples]
+                if h.ndim != 7:
+                    raise ValueError(
+                        f"Expected 7-D tensor for '{dataset_name}', got shape {h.shape}"
+                    )
 
-        h = tf.convert_to_tensor(h, dtype=tf.complex64)
-        # tattle(h, 5, ("h"))
+                if layout != "sampler_direct":
+                    # MATLAB v7.3/HDF5 dimension order appears reversed in h5py.
+                    # Read shape example:
+                    #   (fft_size, num_sym, num_tx_ant, num_tx, num_rx_ant, num_rx, batch)
+                    # Convert to:
+                    #   (batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft_size)
+                    h = np.transpose(h, (6, 5, 4, 3, 2, 1, 0))
+                if max_num_examples != -1:
+                    h = h[:max_num_examples]
+                return tf.convert_to_tensor(h, dtype=tf.complex64)
+            except Exception as exc:
+                errors.append(exc)
 
-        return h
+        err_lines = [f"Could not load MATLAB dataset '{dataset_name}' from '{mat_filename}'."]
+        if scipy_io is None:
+            err_lines.append("scipy.io is not available for standard MAT files.")
+        if h5py is None:
+            err_lines.append("h5py is not available for MATLAB v7.3 / HDF5 files.")
+        if errors:
+            err_lines.append("Loader errors:")
+            err_lines.extend([f"- {type(err).__name__}: {err}" for err in errors[-2:]])
+        raise ValueError("\n".join(err_lines))
 
     def __call__(self,
                  batch_size=None,
