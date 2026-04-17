@@ -229,6 +229,35 @@ class E2E_Model(Model):
         else:
             raise NotImplementedError("Unknown system selected!")
 
+    # def _preprocess_channel_ground_truth(self, h):
+    #     # h : [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_effective_subcarriers]
+
+    #     # Assume only one rx
+    #     # [batch_size, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
+    #     h = tf.squeeze(h, axis=1)
+    #     # print(f"h[batch_size, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]:{tf.shape(h)}")
+
+    #     # Reshape h
+    #     # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant, num_tx_ant]
+    #     h = tf.transpose(h, perm=[0,2,5,4,1,3])
+    #     # print(f"h[batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant, num_tx_ant]:{tf.shape(h)}")
+
+
+
+    #     # print(f"[md_rx] precoding mat: {self._precoding_mat}")
+    #     # Multiply by precoding matrices to compute effective channels
+    #     # [1, num_tx, 1, 1, num_tx_ant, 1]
+    #     w = insert_dims(tf.expand_dims(self._precoding_mat, axis=0), 2, 2)
+    #     # [batch size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
+    #     h = tf.squeeze(tf.matmul(h, w), axis=-1)
+
+
+    #     # Complex-to-real
+    #     # [batch size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+    #     h = tf.concat([tf.math.real(h), tf.math.imag(h)], axis=-1)
+    #     # print(f"[estimate] h {tf.shape(h)}")
+    #     return h
+    
     def _apply_precoding_effect(self, h):
         # apply precoding matrix to channel
         # h : [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_effective_subcarriers]
@@ -248,9 +277,9 @@ class E2E_Model(Model):
         # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
         h = tf.squeeze(tf.matmul(h, w), axis=-1)
 
-        # # Complex-to-real
-        # # [batch size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
-        # h = tf.concat([tf.math.real(h), tf.math.imag(h)], axis=-1)
+        # Complex-to-real
+        # [batch size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+        h = tf.concat([tf.math.real(h), tf.math.imag(h)], axis=-1)
 
         return h
 
@@ -292,30 +321,66 @@ class E2E_Model(Model):
                           mcs_arr_eval_idx, tb_crc_status=None):
         """Remove inactive users/layers from b and b_hat
         """
-        batch_size = tf.shape(b)[0]
+        batch_size = tf.shape(b)[0]  # [], from b: [batch_size, max_num_tx, tb_size]
 
         # only focus on active users
-        a_mask = expand_to_rank(active_dmrs, tf.rank(b_hat), axis=-1)
-        a_mask = tf.broadcast_to(a_mask, tf.shape(b_hat))
+        a_mask = expand_to_rank(active_dmrs, tf.rank(b_hat), axis=-1)  # [batch_size, max_num_tx, 1]
+        a_mask = tf.broadcast_to(a_mask, tf.shape(b_hat))  # [batch_size, max_num_tx, tb_size]
 
-        b_hat = tf.boolean_mask(b_hat, a_mask)
+        b_hat = tf.boolean_mask(b_hat, a_mask)  # [batch_size * num_tx * tb_size]
         b_hat = tf.reshape(b_hat,
                            (batch_size, num_tx, self._transmitters
-                            [mcs_arr_eval_idx]._tb_size))
+                            [mcs_arr_eval_idx]._tb_size))  # [batch_size, num_tx, tb_size]
 
-        b = tf.boolean_mask(b, a_mask)
+        b = tf.boolean_mask(b, a_mask)  # [batch_size * num_tx * tb_size]
         b = tf.reshape(b, (batch_size, num_tx, self._transmitters
-                           [mcs_arr_eval_idx]._tb_size))
+                           [mcs_arr_eval_idx]._tb_size))  # [batch_size, num_tx, tb_size]
 
         if tb_crc_status is not None:
             a_mask = expand_to_rank(active_dmrs, tf.rank(tb_crc_status),
-                                    axis=-1)
-            a_mask = tf.broadcast_to(a_mask, tf.shape(tb_crc_status))
-            tb_crc_status = tf.boolean_mask(tb_crc_status, a_mask)
-            tb_crc_status = tf.reshape(tb_crc_status, (batch_size, num_tx))
+                                    axis=-1)  # [batch_size, max_num_tx]
+            a_mask = tf.broadcast_to(a_mask, tf.shape(tb_crc_status))  # [batch_size, max_num_tx]
+            tb_crc_status = tf.boolean_mask(tb_crc_status, a_mask)  # [batch_size * num_tx]
+            tb_crc_status = tf.reshape(tb_crc_status, (batch_size, num_tx))  # [batch_size, num_tx]
             return b, b_hat, tb_crc_status
 
         return b, b_hat
+
+    def _mask_active_dmrs_channels(self, h,
+                                   batch_size, num_tx, active_dmrs):
+        """Remove inactive users/layers from channel tensors.
+
+        Input shapes:
+
+            h: [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+
+            batch_size: []
+            num_tx: []
+            active_dmrs: [batch_size, max_num_tx]
+
+        Output:
+            h: [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+
+        """
+        # [5] -> [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+        output_shape = tf.concat([[batch_size, num_tx],
+                                        tf.shape(h)[2:]],
+                                        axis=0)
+        # [batch_size, max_num_tx, 1, 1, 1]
+        a_mask = expand_to_rank(active_dmrs,
+                                tf.rank(h), axis=-1)
+        
+        # [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+        a_mask = tf.broadcast_to(a_mask, tf.shape(h))
+
+        # [batch_size * num_tx * fft * num_ofdm_symbols * 2*num_rx_ant]
+        h = tf.boolean_mask(h, a_mask)
+
+        # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+        h = tf.reshape(h, output_shape)
+
+        return h
+
 
     def _set_transmitter_random_pilots(self):
         """
@@ -482,22 +547,16 @@ class E2E_Model(Model):
             y, h = self._channel([x, no])
 
         
-        # [batch_size, num_tx, num_rx, num_clusters, num_rays, 4]
-        # print(f"[e2e] {self._sys_parameters.channel_model.channel_params.phi[0,0,0,0,0,:]}")
-
-        # h : [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, num_effective_subcarriers]
-        # print(f"h[batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant,num_ofdm_symbols, num_effective_subcarriers]:{tf.shape(h)}")
-        # print(f"x[batch_size, max_num_tx, num_tx_ant, num_ofdm_symbols, fft_size]:{x.shape}")
-        # print(f"y[batch_size, num_rx, num_rx_ant, num_ofdm_symbols, num_subcarriers]:{y.shape}")
         
         # h input to precoding effect:
-        # [batch_size, num_rx, num_rx_ant, num_tx, num_tx_ant,
-        #  num_ofdm_symbols, num_effective_subcarriers]
-        
+        # [batch_size, max_num_tx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft]
+
         # h_perf after applying the precoder and removing the single-rx axis:
-        # [batch_size, num_tx, num_effective_subcarriers,
-        #  num_ofdm_symbols, num_rx_ant]
+        # [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
         h_perf = self._apply_precoding_effect(h)
+
+        # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+        h_perf = self._mask_active_dmrs_channels(h_perf)
         ###################################
         # Receiver
         ###################################
@@ -537,79 +596,120 @@ class E2E_Model(Model):
                                                   mcs_arr_eval[0])
             
             if h_hat is not None: # single rx and single stream assumed
-                # [batch size, num_rx, num_rx_ant, num_tx, num_streams,...
-                #  ...num_ofdm_symbols, fft_size]
-                # to [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
+                # to [batch_size, max_num_tx, fft, num_ofdm_symbols, num_rx_ant]
                 h_hat = tf.squeeze(h_hat, axis=(1,4,)) #[B,RA,T,14, F]
                 h_hat = tf.transpose(h_hat, perm=[0,2,4,3,1]) #[B,T,F,14,RA]
+                # Complex-to-real
+                # [batch size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat = tf.concat([tf.math.real(h_hat), tf.math.imag(h_hat)], axis=-1)
 
-
-            # if self._output_channel_est_only:
-            #     return h_perf, h_hat
-            # if self._return_tb_status:
-            #     return b, b_hat, tb_crc_status, h_perf, h_hat
-            # return b, b_hat, h_perf, h_hat
-        
-
+                # return channel only for active DMRS ports
+                # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat = self._mask_active_dmrs_channels(h_hat, batch_size, num_tx, active_dmrs)
 
             if self._return_tb_status:
                 if return_channel:
-                    return b, b_hat, tb_crc_status, h, h_hat
+                    return b, b_hat, tb_crc_status, h_perf, h_hat
                 else:
                     return b, b_hat, tb_crc_status
             else:
                 if return_channel:
-                    return b, b_hat, h, h_hat
+                    return b, b_hat, h_perf, h_hat
                 else:
                     return b, b_hat            
 
 
-            # h_hat [batch_size, num_tx, num_effective_subcarriers,
-            #                     num_ofdm_symbols, 2*num_rx_ant]
-
-            # h_hat_refined=None
-            # if self._return_tb_status:
-            #     if return_channel:
-            #             return b, b_hat, tb_crc_status, h, h_hat
-            #         else:
-            #             return b, b_hat, tb_crc_status
-            #     else:
-            #         if return_channel:
-            #             return b, b_hat, h, h_hat
-            #         else:
-            #             return b, b_hat
 
         elif self._sys_parameters.system in ('baseline_perf_csi_kbest',
                                              'baseline_perf_csi_lmmse'):
-
             # perfect CSI receiver needs ground truth channel
-            b_hat = self._receiver([y, h, no])
+            if self._return_tb_status:
+                # b_hat: [batch_size, max_num_tx, tb_size]
+                # tb_crc_status: [batch_size, max_num_tx]
+                # h_hat: [batch_size, num_rx, num_rx_ant, num_tx,
+                #         num_streams, num_ofdm_symbols, fft_size]
+                b_hat, tb_crc_status, h_hat = self._receiver([y, h, no])
+                b, b_hat, tb_crc_status = self._mask_active_dmrs(
+                    b[0],
+                    b_hat,
+                    num_tx,
+                    active_dmrs,
+                    mcs_arr_eval[0],
+                    tb_crc_status)
+            else:
+                # b_hat: [batch_size, max_num_tx, tb_size]
+                # h_hat: [batch_size, num_rx, num_rx_ant, num_tx,
+                #         num_streams, num_ofdm_symbols, fft_size]
+                b_hat, h_hat = self._receiver([y, h, no])
+                tb_crc_status = None
+                # return b[0] and b_hat only for active DMRS ports
+                # b only holds bits corresponding to MCS indices specified
+                # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
+                b, b_hat = self._mask_active_dmrs(b[0], b_hat, num_tx,
+                                                  active_dmrs,
+                                                  mcs_arr_eval[0])
 
-            # if self._return_tb_status:
-            #     b_hat, tb_crc_status = b_hat
-            # else:
-            #     tb_crc_status = None
+            if h_hat is not None: # single rx and single stream assumed
+                # to [batch_size, max_num_tx, fft, num_ofdm_symbols, num_rx_ant]
+                h_hat = tf.squeeze(h_hat, axis=(1,4,)) #[B,RA,T,14, F]
+                h_hat = tf.transpose(h_hat, perm=[0,2,4,3,1]) #[B,T,F,14,RA]
+                # Complex-to-real
+                # [batch size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat = tf.concat([tf.math.real(h_hat), tf.math.imag(h_hat)], axis=-1)
 
+                # return channel only for active DMRS ports
+                # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat = self._mask_active_dmrs_channels(h_hat, batch_size, num_tx, active_dmrs)
 
             if self._return_tb_status:
-                b_hat, tb_crc_status, h_hat = b_hat
+                if return_channel:
+                    return b, b_hat, tb_crc_status, h_perf, h_hat
+                else:
+                    return b, b_hat, tb_crc_status
             else:
-                b_hat, h_hat = b_hat
-                tb_crc_status = None
+                if return_channel:
+                    return b, b_hat, h_perf, h_hat
+                else:
+                    return b, b_hat
 
-            # return b[0] and b_hat only for active DMRS ports
-            # b only holds bits corresponding to MCS indices specified
-            # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
-            return self._mask_active_dmrs(b[0], b_hat, num_tx,
-                                          active_dmrs, mcs_arr_eval[0],
-                                          tb_crc_status)
+            # older case
+            # b_hat = self._receiver([y, h, no])
+
+            # # if self._return_tb_status:
+            # #     b_hat, tb_crc_status = b_hat
+            # # else:
+            # #     tb_crc_status = None
+
+
+            # if self._return_tb_status:
+            #     b_hat, tb_crc_status, h_hat = b_hat
+            # else:
+            #     b_hat, h_hat = b_hat
+            #     tb_crc_status = None
+
+            # # return b[0] and b_hat only for active DMRS ports
+            # # b only holds bits corresponding to MCS indices specified
+            # # in mcs_arr_eval --> evaluation for one MCS only --> b[0]
+            # return self._mask_active_dmrs(b[0], b_hat, num_tx,
+            #                               active_dmrs, mcs_arr_eval[0],
+            #                               tb_crc_status)
+
+
 
         elif self._sys_parameters.system in ("nrx", "nrx_kbest"):
-
+            # NRX branch inputs:
+            # y: [batch_size, num_rx, num_rx_ant, num_ofdm_symbols,
+            #     num_subcarriers]
+            # active_dmrs: [batch_size, max_num_tx]
+            # b[0]: [batch_size, max_num_tx, tb_size]
+            # h: [batch_size, num_rx, num_rx_ant, max_num_tx, num_tx_ant,
+            #     num_ofdm_symbols, num_effective_subcarriers]
+            # mcs_ue_mask: [batch_size, max_num_tx, len(mcs_index)]
+            # no: [] or [batch_size]
             # in training mode, only the losses are required
             if self._training:
                 losses = self._receiver([y, active_dmrs, b, h, mcs_ue_mask],
-                                        mcs_arr_eval)
+                                        mcs_arr_eval)  # tuple(loss_data: [], loss_chest: [])
                 return losses
             else:
                 # in inference mode, the neural receiver returns:
@@ -617,17 +717,14 @@ class E2E_Model(Model):
                 # - refined channel estimate h_hat_refined
                 # - initial channel estimate h_hat
                 # - [optional] transport block CRC status
-                # print(f"y:{y.shape}")
-                # print(f"y:{tf.shape(y)}")
                 if self._sys_parameters.system == "nrx_kbest":
-                    receiver_inputs = (y, active_dmrs, no)
+                    receiver_inputs = (y, active_dmrs, no)  # ([batch_size, num_rx, num_rx_ant, num_ofdm_symbols, num_subcarriers], [batch_size, max_num_tx], [] or [batch_size])
                 else:
-                    receiver_inputs = (y, active_dmrs)
+                    receiver_inputs = (y, active_dmrs)  # ([batch_size, num_rx, num_rx_ant, num_ofdm_symbols, num_subcarriers], [batch_size, max_num_tx])
                 b_hat, h_hat_refined, h_hat, tb_crc_status = \
                                 self._receiver(receiver_inputs,
                                                 mcs_arr_eval,
-                                                mcs_ue_mask_eval=mcs_ue_mask)
-                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
+                                                mcs_ue_mask_eval=mcs_ue_mask)  # b_hat: [batch_size, max_num_tx, tb_size], h_hat_refined: [batch_size, max_num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant], h_hat: [batch_size, max_num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant], tb_crc_status: [batch_size, max_num_tx]
 
                 #################################
                 # Only focus on active DMRS ports
@@ -639,25 +736,23 @@ class E2E_Model(Model):
                                                                 num_tx,
                                                                 active_dmrs,
                                                                 mcs_arr_eval[0],
-                                                                tb_crc_status)
-
+                                                                tb_crc_status)  # b: [batch_size, num_tx, tb_size], b_hat: [batch_size, num_tx, tb_size], tb_crc_status: [batch_size, num_tx]
                 # Channel estimates
                 h_hat_output_shape = tf.concat([[batch_size, num_tx],
                                                 tf.shape(h_hat_refined)[2:]],
-                                                axis=0)
+                                                axis=0)  # [5] -> [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
                 a_mask = expand_to_rank(active_dmrs,
-                                        tf.rank(h_hat_refined), axis=-1)
-                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
+                                        tf.rank(h_hat_refined), axis=-1)  # [batch_size, max_num_tx, 1, 1, 1]
+                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))  # [batch_size, max_num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
                 if h_hat is not None:
-                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
-                    h_hat = tf.boolean_mask(h_hat, a_mask)
-                    h_hat = tf.reshape(h_hat, h_hat_output_shape)
-                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
-                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)
+                    h_hat = tf.boolean_mask(h_hat, a_mask)  # [batch_size * num_tx * num_effective_subcarriers * num_ofdm_symbols * 2*num_rx_ant]
+                    h_hat = tf.reshape(h_hat, h_hat_output_shape)  # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)  # [batch_size * num_tx * num_effective_subcarriers * num_ofdm_symbols * 2*num_rx_ant]
+                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)  # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
                 # Channel ground truth
-                h = self._receiver.preprocess_channel_ground_truth(h)
-                h = tf.boolean_mask(h, a_mask)
-                h = tf.reshape(h, h_hat_output_shape)
+                h = self._receiver.preprocess_channel_ground_truth(h)  # [batch_size, max_num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
+                h = tf.boolean_mask(h, a_mask)  # [batch_size * num_tx * num_effective_subcarriers * num_ofdm_symbols * 2*num_rx_ant]
+                h = tf.reshape(h, h_hat_output_shape)  # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
 
                 # if activated, return channel estimates (and ground truth CFRs)
                 if self._return_tb_status:
@@ -667,11 +762,11 @@ class E2E_Model(Model):
                         return b, b_hat, tb_crc_status
                 else:
                     if return_channel:
-                        return b, b_hat, h, h_hat_refined, h_hat
+                        return b, b_hat, h, h_hat_refined #, h_hat
                     else:
                         return b, b_hat
 
-        elif self._sys_parameters.system == "mdx":
+        elif self._sys_parameters.system == "mdx": # will be removed
 
             # in training mode, only the losses are required
             if self._training:
@@ -685,13 +780,10 @@ class E2E_Model(Model):
                 # - refined channel estimate h_hat_refined
                 # - initial channel estimate h_hat
                 # - [optional] transport block CRC status
-                # print(f"y:{y.shape}")
-                # print(f"y:{tf.shape(y)}")
                 b_hat, h_hat_refined, h_hat, tb_crc_status = \
                                 self._receiver((y, active_dmrs, no, mcs_ue_mask,x,h, batch_size),
                                                 mcs_arr_eval=mcs_arr_eval,
                                                 mcs_ue_mask_eval=mcs_ue_mask)
-                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
 
                 #################################
                 # Only focus on active DMRS ports
@@ -705,23 +797,8 @@ class E2E_Model(Model):
                                                                 mcs_arr_eval[0],
                                                                 tb_crc_status)
 
-                # Channel estimates
-                h_hat_output_shape = tf.concat([[batch_size, num_tx],
-                                                tf.shape(h_hat_refined)[2:]],
-                                                axis=0)
-                a_mask = expand_to_rank(active_dmrs,
-                                        tf.rank(h_hat_refined), axis=-1)
-                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
-                if h_hat is not None:
-                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
-                    h_hat = tf.boolean_mask(h_hat, a_mask)
-                    h_hat = tf.reshape(h_hat, h_hat_output_shape)
-                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
-                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)
-                # Channel ground truth
-                h = self._receiver.preprocess_channel_ground_truth(h)
-                h = tf.boolean_mask(h, a_mask)
-                h = tf.reshape(h, h_hat_output_shape)
+                h, h_hat_refined, h_hat = self._mask_active_dmrs_channels(
+                    h, h_hat_refined, h_hat, batch_size, num_tx, active_dmrs)
 
                 # 
 
@@ -731,7 +808,7 @@ class E2E_Model(Model):
                 # if activated, return channel estimates (and ground truth CFRs)
                 if self._return_tb_status:
                     if return_channel:
-                        return b, b_hat, tb_crc_status, h, h_hat_refined, h_hat
+                        return b, b_hat, tb_crc_status, h, h_hat_refined #, h_hat
                     else:
                         return b, b_hat, tb_crc_status
                 else:
@@ -750,12 +827,14 @@ class E2E_Model(Model):
                                         
                 return losses
             else:
-
+                # b_hat: [batch_size, max_num_tx, tb_size], 
+                # h_hat_refined: [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant], 
+                # h_hat: [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant], 
+                # tb_crc_status: [batch_size, max_num_tx]
                 b_hat, h_hat_refined, h_hat, tb_crc_status = \
                                 self._receiver((y, active_dmrs, no, mcs_ue_mask,x,h, batch_size),
                                                 mcs_arr_eval=mcs_arr_eval,
-                                                mcs_ue_mask_eval=mcs_ue_mask)
-                # print(f"b_hat: {b_hat.shape}, h_hat_refined: {h_hat_refined.shape}, h_hat: {h_hat.shape}")
+                                                mcs_ue_mask_eval=mcs_ue_mask)  
 
                 #################################
                 # Only focus on active DMRS ports
@@ -768,53 +847,21 @@ class E2E_Model(Model):
                                                                 active_dmrs,
                                                                 mcs_arr_eval[0],
                                                                 tb_crc_status)
-                # Channel estimates
-                h_hat_output_shape = tf.concat([[batch_size, num_tx],
-                                                tf.shape(h_hat_refined)[2:]],
-                                                axis=0)
-                a_mask = expand_to_rank(active_dmrs,
-                                        tf.rank(h_hat_refined), axis=-1)
-                a_mask = tf.broadcast_to(a_mask, tf.shape(h_hat_refined))
-                if h_hat is not None:
-                    # print(f'h_hat:{h_hat.shape}, a_mask:{a_mask.shape}')
-                    h_hat = tf.boolean_mask(h_hat, a_mask)
-                    h_hat = tf.reshape(h_hat, h_hat_output_shape)
-                h_hat_refined = tf.boolean_mask(h_hat_refined, a_mask)
-                h_hat_refined = tf.reshape(h_hat_refined, h_hat_output_shape)
+                
 
-                # Channel ground truth
-                # h: [batch_size, num_rx, num_rx_ant, max_num_tx, num_tx_ant,
-                #     num_ofdm_symbols, num_effective_subcarriers]
-                h = self._receiver.preprocess_channel_ground_truth(h)
-                # h: [batch_size, max_num_tx, num_effective_subcarriers,
-                #     num_ofdm_symbols, 2*num_rx_ant]
-                h = tf.boolean_mask(h, a_mask)
-                # h: [batch_size * num_tx * num_effective_subcarriers *
-                #     num_ofdm_symbols * 2*num_rx_ant]
-                h = tf.reshape(h, h_hat_output_shape)
-                # h: [batch_size, num_tx, num_effective_subcarriers,
-                #     num_ofdm_symbols, 2*num_rx_ant]
-
-
-
-                if self._output_channel_est_only:
-                    # [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, 2*num_rx_ant]
-                    # to [batch_size, num_tx, num_effective_subcarriers, num_ofdm_symbols, num_rx_ant]
-                    real_part, imag_part = tf.split(h_hat_refined, num_or_size_splits=2, axis=-1)
-                    h_hat_refined = tf.complex(real_part,imag_part)
-                    return h_perf, h_hat_refined
-
+                # [batch_size, num_tx, fft, num_ofdm_symbols, 2*num_rx_ant]
+                h_hat_refined = self._mask_active_dmrs_channels(h_hat_refined, batch_size, num_tx, active_dmrs)
 
 
                 # if activated, return channel estimates (and ground truth CFRs)
                 if self._return_tb_status:
                     if return_channel:
-                        return b, b_hat, tb_crc_status, h, h_hat_refined, h_hat
+                        return b, b_hat, tb_crc_status, h, h_hat_refined #, h_hat
                     else:
                         return b, b_hat, tb_crc_status
                 else:
                     if return_channel:
-                        return b, b_hat, h, h_hat_refined, h_hat
+                        return b, b_hat, h, h_hat_refined #, h_hat
                     else:
                         return b, b_hat
 
