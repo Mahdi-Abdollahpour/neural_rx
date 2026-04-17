@@ -44,7 +44,7 @@ from sionna.utils import ebnodb2no, expand_to_rank
 
 import h5py
 
-from utils.helpers import dbg
+from utils import dbg
 
 # tf.debugging.set_log_device_placement(True)
 # tf.debugging.enable_check_numerics()
