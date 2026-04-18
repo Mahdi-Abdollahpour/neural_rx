@@ -832,7 +832,7 @@ class E2E_Model(Model):
                 # h_hat: [batch_size, max_num_tx, fft, num_ofdm_symbols, 2*num_rx_ant], 
                 # tb_crc_status: [batch_size, max_num_tx]
                 b_hat, h_hat_refined, h_hat, tb_crc_status = \
-                                self._receiver((y, active_dmrs, no, mcs_ue_mask,x,h, batch_size),
+                                self._receiver((y, active_dmrs, no, mcs_ue_mask, h),
                                                 mcs_arr_eval=mcs_arr_eval,
                                                 mcs_ue_mask_eval=mcs_ue_mask)  
 
