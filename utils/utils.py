@@ -890,11 +890,11 @@ def training_loop(model, label, filename, training_logdir, training_seed,
                             if isinstance(value, dict):
                                 # handle nested dicts (e.g. EchoLoss)
                                 # log only first mcs for echoloss eval
-                                if mcs_i==0:
-                                    for sub_name, sub_value in value.items():
-                                        sub_value = tf.convert_to_tensor(sub_value)
-                                        sub_value = tf.reshape(sub_value, [])
-                                        tf.summary.scalar(f"{name}/{sub_name}/Eval:"+str(mcs_arr_idx), sub_value, step=global_iter)
+                                # if mcs_i==0:
+                                for sub_name, sub_value in value.items():
+                                    sub_value = tf.convert_to_tensor(sub_value)
+                                    sub_value = tf.reshape(sub_value, [])
+                                    tf.summary.scalar(f"{name}/{sub_name}/Eval:"+str(mcs_arr_idx), sub_value, step=global_iter)
                             else:
                                 # handle scalar values
                                 value = tf.convert_to_tensor(value)

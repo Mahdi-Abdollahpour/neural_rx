@@ -650,4 +650,4 @@ class Parameters:
 
 
         else:
-            raise ValueError("Unknown Channel type.")
+            raise ValueError(f"{self.name} Unknown Channel type \'{self.channel_type}\'!")
