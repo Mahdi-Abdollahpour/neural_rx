@@ -139,7 +139,7 @@ import numpy as np
 import pickle
 from os.path import exists
 
-from utils.model_weights import transfer_weights_from_h5
+from utils.model_weights import load_or_transfer_weights
 
 if args.debug:
     tf.config.run_functions_eagerly(True)
@@ -344,7 +344,7 @@ for num_tx_eval in num_tx_evals:
             start_token_file  = getattr(sys_parameters, "start_token_file",  None)
             if forced_transfer:
                 if exists(sys_parameters.transfer_weights_path):
-                    transfer_weights_from_h5(e2e_nn, sys_parameters.transfer_weights_path,
+                    load_or_transfer_weights(e2e_nn, sys_parameters.transfer_weights_path,
                     start_token_model=start_token_model,
                     start_token_file=start_token_file,
                     verbose=1)
@@ -356,7 +356,7 @@ for num_tx_eval in num_tx_evals:
                     load_weights(e2e_nn, filename)
                     print(f"weights loaded from:\n{filename}")
                 elif exists(sys_parameters.transfer_weights_path):
-                    transfer_weights_from_h5(e2e_nn, sys_parameters.transfer_weights_path,
+                    load_or_transfer_weights(e2e_nn, sys_parameters.transfer_weights_path,
                     start_token_model=start_token_model,
                     start_token_file=start_token_file,
                     verbose=1)
@@ -456,7 +456,7 @@ for num_tx_eval in num_tx_evals:
             
             if forced_transfer:
                 if exists(sys_parameters.transfer_weights_path):
-                    transfer_weights_from_h5(e2e_nn, sys_parameters.transfer_weights_path,
+                    load_or_transfer_weights(e2e_nn, sys_parameters.transfer_weights_path,
                     start_token="neural_pusch_receiver/cgnnofdm", verbose=False)
                     print(f"weights transfered from:\n{sys_parameters.transfer_weights_path}")
                 else:
@@ -466,7 +466,7 @@ for num_tx_eval in num_tx_evals:
                     load_weights(e2e_nn, filename)
                     print(f"weights loaded from:\n{filename}")
                 elif exists(sys_parameters.transfer_weights_path):
-                    transfer_weights_from_h5(e2e_nn, sys_parameters.transfer_weights_path,
+                    load_or_transfer_weights(e2e_nn, sys_parameters.transfer_weights_path,
                     start_token="neural_pusch_receiver/cgnnofdm", verbose=False)
                     print(f"weights transfered from:\n{sys_parameters.transfer_weights_path}")
                 else:

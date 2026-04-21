@@ -109,7 +109,7 @@ if args.debug:
 
 
 from ext.neural_rx.utils.e2e_model import E2E_Model
-from utils.model_weights import compute_lr_multipliers, transfer_weights_from_h5
+from utils.model_weights import compute_lr_multipliers, load_or_transfer_weights
 from ext.neural_rx.utils.parameters import Parameters
 from ext.neural_rx.utils.utils import load_weights, save_weights, training_loop
 
@@ -178,7 +178,7 @@ if hasattr(sys_parameters, "transfer_weights_path"):
             start_token_model = getattr(sys_parameters, "start_token_model", None)
             start_token_file = getattr(sys_parameters, "start_token_file", None)
 
-            transfer_weights_from_h5(
+            load_or_transfer_weights(
                 sys_training,
                 paths,  # list of paths
                 start_token_model=start_token_model,
@@ -197,7 +197,7 @@ if hasattr(sys_parameters, "transfer_weights_path"):
             start_token_model = getattr(sys_parameters, "start_token_model", None)
             start_token_file = getattr(sys_parameters, "start_token_file", None)
 
-            transfer_weights_from_h5(
+            load_or_transfer_weights(
                 sys_training,
                 paths,  # single path
                 start_token_model=start_token_model,
@@ -220,7 +220,7 @@ if hasattr(sys_parameters, "transfer_weights_path"):
     #         start_token_model = sys_parameters.start_token_model
     #     if hasattr(sys_parameters, 'start_token_file'):
     #         start_token_file = sys_parameters.start_token_file
-    #     transfer_weights_from_h5(sys_training, sys_parameters.transfer_weights_path,
+    #     load_or_transfer_weights(sys_training, sys_parameters.transfer_weights_path,
     #      start_token_model=start_token_model, start_token_file=start_token_file, verbose=1)
 
     #     transfer_loaded = True
