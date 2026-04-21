@@ -18,6 +18,7 @@ from sionna.utils import BinarySource, ebnodb2no, expand_to_rank, log10, flatten
 from .baseline_rx import BaselineReceiver
 from receivers.deep_echo import DeepEcho5G
 from receivers.deep_echo_kbest import DeepEchoKBest5G
+from receivers.ch_saver import ChSaver5G
 from receivers.md_rx import MDNeuralPUSCHReceiver
 from .neural_rx import NeuralPUSCHReceiver
 from receivers.neural_rx_kbest import NeuralKBestPUSCHReceiver
@@ -226,6 +227,12 @@ class E2E_Model(Model):
             self._receiver = DeepEchoKBest5G(
                                     self._sys_parameters,
                                     training)
+        elif self._sys_parameters.system == "ch_saver":
+            self._sys_name = "Channel Saver"
+            self._receiver = ChSaver5G(
+                                    self._sys_parameters,
+                                    save_path=getattr(self._sys_parameters,
+                                                      'ch_save_path', 'ch_save.h5'))
         else:
             raise NotImplementedError("Unknown system selected!")
 
@@ -932,6 +939,12 @@ class E2E_Model(Model):
 
 
 
+
+        elif self._sys_parameters.system == "ch_saver":
+            # Save (h_freq, h_ls, no) to HDF5; no decoding performed.
+            h_freq, h_ls, no_vec = self._receiver(
+                (y, active_dmrs, no, mcs_ue_mask, h), mcs_arr_eval)
+            return h_freq, h_ls, no_vec
 
         else:
             raise ValueError("Unknown system selected!")

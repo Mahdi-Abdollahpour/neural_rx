@@ -45,6 +45,8 @@ class Parameters:
         * "baseline_lmmse_lmmse" : LMMSE estimation and LMMSE equalization
         * "baseline_lsnn_lmmse" : LS estimation/nn interpolation and LMMSE equalization
         * "baseline_lsnn_kbest" : LS estimation/nn interpolation and K-Best equalization
+        * "ch_saver" : saves (h_freq, h_ls, no) to HDF5; no decoding performed.
+          Requires ``ch_save_path`` to be set in the config (default: 'ch_save.h5').
         * "dummy" : stops after parameter import. Can be used only to parse the
         config.
 
@@ -646,7 +648,7 @@ class Parameters:
                                        normalize_channel=self.channel_norm,
                                        return_channel=True)
 
-            print(f"channel type reinit:{self.channel_type}, training:{self._training}, self.mat_filename:{self.mat_filename}" )
+            # print(f"channel type reinit:{self.channel_type}, training:{self._training}, self.mat_filename:{self.mat_filename}, norm:{self.channel_norm}" )
 
 
         else:

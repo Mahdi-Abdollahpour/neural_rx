@@ -933,7 +933,7 @@ class OFDMDatasetChannel(Layer):
     """
 
     def __init__(self, channel_model, add_awgn=True,
-                normalize_channel=False, return_channel=False,
+                normalize_channel=True, return_channel=False,
                 dtype=tf.complex64, **kwargs):
         super().__init__(trainable=False, dtype=dtype, **kwargs)
 
@@ -947,23 +947,45 @@ class OFDMDatasetChannel(Layer):
         self._apply_channel = ApplyOFDMChannel( self._add_awgn,
                                                 tf.as_dtype(self.dtype))
 
-    def call(self, inputs):
-
-        if self._add_awgn:
-            x, no = inputs
+    def _normalize_h_freq(self, h_freq):
+        """Match Sionna's cir_to_ofdm_channel normalization on loaded OFDM data."""
+        rank = h_freq.shape.rank
+        if rank is None:
+            reduce_axes = (2, 4, 5, 6)
         else:
-            x = inputs
+            # Keep batch, RX, and TX link axes and average over every other
+            # dimension so each sampled link has unit average energy.
+            reduce_axes = tuple(axis for axis in range(rank) if axis not in (0, 1, 3))
 
-        h_freq = self._channel_sampler(tf.shape(x)[0])
+        scale = tf.reduce_mean(
+            tf.square(tf.abs(h_freq)),
+            axis=reduce_axes,
+            keepdims=True,
+        )
+        scale = tf.cast(tf.sqrt(scale), h_freq.dtype)
+        return tf.math.divide_no_nan(h_freq, scale)
+
+    def call(self, inputs):
+        # Shapes: B=batch, R=num_rx, RA=num_rx_ant, T=num_tx, TA=num_tx_ant, S=num_ofdm_symbols, F=fft_size
+        if self._add_awgn:
+            x, no = inputs # x:[B, T, TA, S, F], no:broadcastable to [B, R, RA, S, F]
+        else:
+            x = inputs # x:[B, T, TA, S, F]
+
+
+        h_freq = self._channel_sampler(tf.shape(x)[0]) # [B, R, RA, T, TA, S, F]
+
+        if self._normalize_channel:
+            h_freq = self._normalize_h_freq(h_freq) # [B, R, RA, T, TA, S, F]
 
         # tattle((x,h_freq),3, ("x","h_freq"))
 
         if self._add_awgn:
-            y = self._apply_channel([x, h_freq, no])
+            y = self._apply_channel([x, h_freq, no]) # [B, R, RA, S, F]
         else:
-            y = self._apply_channel([x, h_freq])
+            y = self._apply_channel([x, h_freq]) # [B, R, RA, S, F]
 
         if self._return_channel:
-            return y, h_freq
+            return y, h_freq # y:[B, R, RA, S, F], h_freq:[B, R, RA, T, TA, S, F]
         else:
-            return y
+            return y # [B, R, RA, S, F]
