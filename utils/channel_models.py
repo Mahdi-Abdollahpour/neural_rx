@@ -682,7 +682,6 @@ class OFDMDatasetChannelSampler(ChannelModel):
         # h_freq shape:
         # [N, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
         if training:
-            # Same partitioning logic as the original code:
             # split dataset into equal subsets, one subset per user stream.
             num_examples = int(h_freq.shape[0] // self._num_tx)
             self._num_examples = num_examples
@@ -734,6 +733,7 @@ class OFDMDatasetChannelSampler(ChannelModel):
             num_ofdm_symbols, fft_size]
         """
         errors = []
+        h = None
 
         if scipy_io is not None:
             try:
@@ -747,11 +747,11 @@ class OFDMDatasetChannelSampler(ChannelModel):
                     )
                 if max_num_examples != -1:
                     h = h[:max_num_examples]
-                return tf.convert_to_tensor(h, dtype=tf.complex64)
             except Exception as exc:  # fallback to HDF5/v7.3 reader if needed
                 errors.append(exc)
+                h = None
 
-        if h5py is not None:
+        if h is None and h5py is not None:
             try:
                 with h5py.File(mat_filename, "r") as f:
                     if dataset_name not in f:
@@ -777,19 +777,23 @@ class OFDMDatasetChannelSampler(ChannelModel):
                     h = np.transpose(h, (6, 5, 4, 3, 2, 1, 0))
                 if max_num_examples != -1:
                     h = h[:max_num_examples]
-                return tf.convert_to_tensor(h, dtype=tf.complex64)
             except Exception as exc:
                 errors.append(exc)
+                h = None
 
-        err_lines = [f"Could not load MATLAB dataset '{dataset_name}' from '{mat_filename}'."]
-        if scipy_io is None:
-            err_lines.append("scipy.io is not available for standard MAT files.")
-        if h5py is None:
-            err_lines.append("h5py is not available for MATLAB v7.3 / HDF5 files.")
-        if errors:
-            err_lines.append("Loader errors:")
-            err_lines.extend([f"- {type(err).__name__}: {err}" for err in errors[-2:]])
-        raise ValueError("\n".join(err_lines))
+        if h is None:
+            err_lines = [f"Could not load MATLAB dataset '{dataset_name}' from '{mat_filename}'."]
+            if scipy_io is None:
+                err_lines.append("scipy.io is not available for standard MAT files.")
+            if h5py is None:
+                err_lines.append("h5py is not available for MATLAB v7.3 / HDF5 files.")
+            if errors:
+                err_lines.append("Loader errors:")
+                err_lines.extend([f"- {type(err).__name__}: {err}" for err in errors[-2:]])
+            raise ValueError("\n".join(err_lines))
+
+        with tf.device("/CPU:0"):
+            return tf.convert_to_tensor(h, dtype=tf.complex64)
 
     def __call__(self,
                  batch_size=None,
