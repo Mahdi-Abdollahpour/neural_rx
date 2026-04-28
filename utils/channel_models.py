@@ -983,6 +983,7 @@ class OFDMDatasetChannel(Layer):
             h_freq = self._normalize_h_freq(h_freq) # [B, R, RA, T, TA, S, F]
 
         # tattle((x,h_freq),3, ("x","h_freq"))
+        # print(f"h_freq[B, R, RA, T, TA, S, F]:{tf.shape(h_freq)}")
 
         if self._add_awgn:
             y = self._apply_channel([x, h_freq, no]) # [B, R, RA, S, F]
