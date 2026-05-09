@@ -739,7 +739,7 @@ def training_loop(model, label, filename, training_logdir, training_seed,
     # XLA compilation function for evaluation of model performance
     # Set different mcs_arr_idx as integer to trigger XLA re-tracing.
     @tf.function(jit_compile=xla)
-    def eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx):
+    def eval_model_xla(batch_size, eval_snr_db, max_num_tx, mcs_arr_idx):
 
         # if sys_parameters.system=='mdx':
         #     bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
@@ -748,15 +748,15 @@ def training_loop(model, label, filename, training_logdir, training_seed,
         #     loss_data_mcs, loss_chest, bce_rel, loss_chest_all, loss_tilde, loss_tilde_all = model(batch_size, _snr_db, num_tx=max_num_tx,
         #                             mcs_arr_eval_idx=mcs_arr_idx)
         #     return loss_data_mcs, loss_chest, bce_rel, loss_chest_all
-
-        if sys_parameters.system=='nrx':
         
-            loss_data_mcs, loss_chest = model(batch_size, _snr_db, num_tx=max_num_tx,
+        if sys_parameters.system=='nrx':
+
+            loss_data_mcs, loss_chest = model(batch_size, eval_snr_db, num_tx=max_num_tx,
                         mcs_arr_eval_idx=mcs_arr_idx)
             return loss_data_mcs, loss_chest
 
         if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-            loss_dict = model(batch_size, _snr_db, num_tx=max_num_tx,
+            loss_dict = model(batch_size, eval_snr_db, num_tx=max_num_tx,
                         mcs_arr_eval_idx=mcs_arr_idx)
             return loss_dict
 
@@ -843,63 +843,69 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
                 # Log progress and model performance
                 for mcs_i, mcs_arr_idx in enumerate(mcs_arr_training_idx):
-                    # compute ebno_db for current MCS
-                    if not sys_parameters.ebno:
-                        # convert EbNo to SNR
-                        _no = ebnodb2no(
-                            eval_ebno_db_arr[mcs_arr_idx],
-                            model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
-                            model._transmitters[mcs_arr_idx]._target_coderate,
-                            model._transmitters[mcs_arr_idx]._resource_grid)
-                        _snr_db = - 10.0 * tf.math.log(_no) / tf.math.log(10.0)
-                    else:
-                        # model takes in EbNo (not SNR)
-                        _snr_db = eval_ebno_db_arr[mcs_arr_idx]
-                    # if sys_parameters.system=='mdx':
-                    #     loss_data_mcs, loss_chestv, bce_rel, loss_chest_allv = eval_model_xla(batch_size, _snr_db,
-                    #                                 max_num_tx, mcs_arr_idx)
-                    #     tf.summary.scalar(
-                    #                 f"Eval CE loss / mcs_arr_idx=" + str(mcs_arr_idx),
-                    #                 loss_data_mcs, step=global_iter)
-                    #     tf.summary.scalar(
-                    #                 f"Eval CHEst loss/ mcs_arr_idx=" + str(mcs_arr_idx),
-                    #                 loss_chestv, step=global_iter)
-                    #     if isinstance(bce_rel, list):
-                    #         for i, value in enumerate(bce_rel):
-                    #             tf.summary.scalar(f"Eval BCE rel. PerfCh {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
-                    #         for i, value in enumerate(loss_chest_allv):
-                    #             tf.summary.scalar(f"Eval CHEst {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+                    eval_ebno_mcsi = eval_ebno_db_arr[mcs_arr_idx]
+                    multi_snr = isinstance(eval_ebno_mcsi, (list, tuple))
+                    eval_ebno_list = eval_ebno_mcsi if multi_snr else [eval_ebno_mcsi]
 
-                    if sys_parameters.system=='nrx':
-                        loss_data_mcs, loss_chestv = eval_model_xla(batch_size, _snr_db,
-                                                    max_num_tx, mcs_arr_idx)    
-                        tf.summary.scalar(
-                                    f"Eval CE loss / mcs_arr_idx=" + str(mcs_arr_idx),
-                                    loss_data_mcs, step=global_iter)
-                        tf.summary.scalar(
-                                    f"Eval CHEst loss/ mcs_arr_idx=" + str(mcs_arr_idx),
-                                    loss_chestv, step=global_iter)
-                                                                                               
+                    for eval_ebno_val in eval_ebno_list:
+                        snr_suffix = f" snr={float(eval_ebno_val):.1f}dB" if multi_snr else ""
+                        # compute ebno_db for current MCS
+                        if not sys_parameters.ebno:
+                            # convert EbNo to SNR
+                            eval_no = ebnodb2no(
+                                eval_ebno_val,
+                                model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
+                                model._transmitters[mcs_arr_idx]._target_coderate,
+                                model._transmitters[mcs_arr_idx]._resource_grid)
+                            eval_snr_db = - 10.0 * tf.math.log(eval_no) / tf.math.log(10.0)
+                        else:
+                            # model takes in EbNo (not SNR)
+                            eval_snr_db = eval_ebno_val
+                        # if sys_parameters.system=='mdx':
+                        #     loss_data_mcs, loss_chestv, bce_rel, loss_chest_allv = eval_model_xla(batch_size, _snr_db,
+                        #                                 max_num_tx, mcs_arr_idx)
+                        #     tf.summary.scalar(
+                        #                 f"Eval CE loss / mcs_arr_idx=" + str(mcs_arr_idx),
+                        #                 loss_data_mcs, step=global_iter)
+                        #     tf.summary.scalar(
+                        #                 f"Eval CHEst loss/ mcs_arr_idx=" + str(mcs_arr_idx),
+                        #                 loss_chestv, step=global_iter)
+                        #     if isinstance(bce_rel, list):
+                        #         for i, value in enumerate(bce_rel):
+                        #             tf.summary.scalar(f"Eval BCE rel. PerfCh {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+                        #         for i, value in enumerate(loss_chest_allv):
+                        #             tf.summary.scalar(f"Eval CHEst {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+
+                        if sys_parameters.system=='nrx':
+                            loss_data_mcs, loss_chestv = eval_model_xla(batch_size, eval_snr_db,
+                                                        max_num_tx, mcs_arr_idx)
+                            tf.summary.scalar(
+                                        f"Eval CE loss / mcs_arr_idx={mcs_arr_idx}{snr_suffix}",
+                                        loss_data_mcs, step=global_iter)
+                            tf.summary.scalar(
+                                        f"Eval CHEst loss/ mcs_arr_idx={mcs_arr_idx}{snr_suffix}",
+                                        loss_chestv, step=global_iter)
 
 
-                    if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                        loss_dict_mcs = eval_model_xla(batch_size, _snr_db,
-                                                    max_num_tx, mcs_arr_idx) 
 
-                        for name, value in loss_dict_mcs.items():
-                            if isinstance(value, dict):
-                                # handle nested dicts (e.g. EchoLoss)
-                                # log only first mcs for echoloss eval
-                                # if mcs_i==0:
-                                for sub_name, sub_value in value.items():
-                                    sub_value = tf.convert_to_tensor(sub_value)
-                                    sub_value = tf.reshape(sub_value, [])
-                                    tf.summary.scalar(f"{name}/{sub_name}/Eval:"+str(mcs_arr_idx), sub_value, step=global_iter)
-                            else:
-                                # handle scalar values
-                                value = tf.convert_to_tensor(value)
-                                value = tf.reshape(value, [])
-                                tf.summary.scalar(f"{name}/ Eval mcs:"+str(mcs_arr_idx), value, step=global_iter)
+                        if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+                            loss_dict_mcs = eval_model_xla(batch_size, eval_snr_db,
+                                                        max_num_tx, mcs_arr_idx)
+
+                            for name, value in loss_dict_mcs.items():
+                                if isinstance(value, dict):
+                                    # handle nested dicts (e.g. EchoLoss)
+                                    # log only first mcs for echoloss eval
+                                    # if mcs_i==0:
+                                    for sub_name, sub_value in value.items():
+                                        sub_value = tf.convert_to_tensor(sub_value)
+                                        sub_value = tf.reshape(sub_value, [])
+                                        tf.summary.scalar(f"{name}/{sub_name}/Eval:{mcs_arr_idx}{snr_suffix}", sub_value, step=global_iter)
+                                else:
+                                    # handle scalar values
+                                    value = tf.convert_to_tensor(value)
+                                    value = tf.reshape(value, [])
+                                    tf.summary.scalar(f"{name}/ Eval mcs:{mcs_arr_idx}{snr_suffix}", value, step=global_iter)
 
                 if sys_parameters.system=='nrx':
                     tf.summary.scalar(f"Loss", loss_data, step=global_iter)
@@ -909,7 +915,7 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
                 if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx': # loss is dict of losses
 
-                    for name, value in loss_dict_mcs.items():
+                    for name, value in loss.items():
                         if isinstance(value, dict):
                             # handle nested dicts (e.g. EchoLoss)
                             for sub_name, sub_value in value.items():
@@ -952,392 +958,392 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 # ________________________________________________________________________
 # ---------------------------Training Loop--------------------------------
 # ________________________________________________________________________
-import os, datetime, numpy as np, tensorflow as tf
+# import os, datetime, numpy as np, tensorflow as tf
 
 
 
 
 
 
-# --- helpers: safe scalar logging (skip NaN/Inf), and profiling blocks --------
-def _is_finite_scalar(x):
-    x = tf.convert_to_tensor(x)
-    x = tf.reshape(x, [])  # scalar
-    return tf.reduce_all(tf.math.is_finite(x))
+# # --- helpers: safe scalar logging (skip NaN/Inf), and profiling blocks --------
+# def _is_finite_scalar(x):
+#     x = tf.convert_to_tensor(x)
+#     x = tf.reshape(x, [])  # scalar
+#     return tf.reduce_all(tf.math.is_finite(x))
 
-def _safe_scalar(tag, value, step, writer):
-    """Log scalar only if finite."""
-    if _is_finite_scalar(value):
-        with writer.as_default():
-            tf.summary.scalar(tag, tf.reshape(value, []), step=step)
+# def _safe_scalar(tag, value, step, writer):
+#     """Log scalar only if finite."""
+#     if _is_finite_scalar(value):
+#         with writer.as_default():
+#             tf.summary.scalar(tag, tf.reshape(value, []), step=step)
 
-class _MaybeProfiler:
-    """Start/stop TF profiler for a short window without touching scalar writer."""
-    def __init__(self, profile_dir, start=True):
-        self.profile_dir = profile_dir
-        self._started = False
-        self._enabled = start
+# class _MaybeProfiler:
+#     """Start/stop TF profiler for a short window without touching scalar writer."""
+#     def __init__(self, profile_dir, start=True):
+#         self.profile_dir = profile_dir
+#         self._started = False
+#         self._enabled = start
 
-    def start(self):
-        if self._enabled and not self._started:
-            try:
-                tf.profiler.experimental.start(self.profile_dir)
-                self._started = True
-            except Exception as e:
-                print(f"[profiler] start failed: {e}")
+#     def start(self):
+#         if self._enabled and not self._started:
+#             try:
+#                 tf.profiler.experimental.start(self.profile_dir)
+#                 self._started = True
+#             except Exception as e:
+#                 print(f"[profiler] start failed: {e}")
 
-    def stop(self):
-        if self._enabled and self._started:
-            try:
-                tf.profiler.experimental.stop()
-            except Exception as e:
-                print(f"[profiler] stop failed: {e}")
-            self._started = False
+#     def stop(self):
+#         if self._enabled and self._started:
+#             try:
+#                 tf.profiler.experimental.stop()
+#             except Exception as e:
+#                 print(f"[profiler] stop failed: {e}")
+#             self._started = False
 
 # ------------------------------------------------------------------------------
 
-def training_loop_(model, label, filename, training_logdir, training_seed,
-                  training_schedule, eval_ebno_db_arr, min_num_tx, max_num_tx,
-                  sys_parameters, mcs_arr_training_idx,
-                  mcs_training_snr_db_offset=None, mcs_training_probs=None,
-                  weight_saving_schedule=None, transfer_loaded=False, xla=False, save_format='pkl'):
-    # pylint: disable=line-too-long
-    r"""
-    Training loop used to train a system ``model``.
+# def training_loop_(model, label, filename, training_logdir, training_seed,
+#                   training_schedule, eval_ebno_db_arr, min_num_tx, max_num_tx,
+#                   sys_parameters, mcs_arr_training_idx,
+#                   mcs_training_snr_db_offset=None, mcs_training_probs=None,
+#                   weight_saving_schedule=None, transfer_loaded=False, xla=False, save_format='pkl'):
+#     # pylint: disable=line-too-long
+#     r"""
+#     Training loop used to train a system ``model``.
 
-    All train/* and eval/* scalars are written into ONE run directory:
-        training_logdir
-    Graph and profiler artifacts are written into:
-        training_logdir + "_graph"
-        training_logdir + "_profile"
-    """
+#     All train/* and eval/* scalars are written into ONE run directory:
+#         training_logdir
+#     Graph and profiler artifacts are written into:
+#         training_logdir + "_graph"
+#         training_logdir + "_profile"
+#     """
 
-    print(f"Training with mixed MCS from arr. idx {mcs_arr_training_idx}. Eval EbNo at {eval_ebno_db_arr} dB.")
-    tf.random.set_seed(training_seed)
+#     print(f"Training with mixed MCS from arr. idx {mcs_arr_training_idx}. Eval EbNo at {eval_ebno_db_arr} dB.")
+#     tf.random.set_seed(training_seed)
 
-    # Sampler for the number of transmitters (assume provided utility)
-    num_tx_sampler = TriangularDistributionSampler(min_num_tx, max_num_tx+1, dtype=tf.int64)
+#     # Sampler for the number of transmitters (assume provided utility)
+#     num_tx_sampler = TriangularDistributionSampler(min_num_tx, max_num_tx+1, dtype=tf.int64)
 
-    optimizer = tf.keras.optimizers.Adam()
-    sn.config.xla_compat = xla  # keep your flag
+#     optimizer = tf.keras.optimizers.Adam()
+#     sn.config.xla_compat = xla  # keep your flag
 
-    if mcs_training_snr_db_offset is not None:
-        mcs_training_snr_db_offset = tf.constant(mcs_training_snr_db_offset, dtype=tf.float32)
+#     if mcs_training_snr_db_offset is not None:
+#         mcs_training_snr_db_offset = tf.constant(mcs_training_snr_db_offset, dtype=tf.float32)
 
-    # -------------------------- compiled inner step ---------------------------
-    @tf.function(jit_compile=xla)
-    def _compile_step(batch_size, min_snr_db, max_snr_db, double_readout,
-                      weighting_double_readout, apply_multiloss, train_tx,
-                      lr_muls, step):
-        # Configure multi-loss inside graph (kept as your logic)
-        if sys_parameters.system=='nrx':
-            model._receiver._neural_rx._cgnn.apply_multiloss = apply_multiloss
+#     # -------------------------- compiled inner step ---------------------------
+#     @tf.function(jit_compile=xla)
+#     def _compile_step(batch_size, min_snr_db, max_snr_db, double_readout,
+#                       weighting_double_readout, apply_multiloss, train_tx,
+#                       lr_muls, step):
+#         # Configure multi-loss inside graph (kept as your logic)
+#         if sys_parameters.system=='nrx':
+#             model._receiver._neural_rx._cgnn.apply_multiloss = apply_multiloss
 
-        # Set constellation trainable flag
-        for tx_ in model._transmitters:
-            tx_._mapper.constellation.trainable = train_tx
+#         # Set constellation trainable flag
+#         for tx_ in model._transmitters:
+#             tx_._mapper.constellation.trainable = train_tx
 
-        bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+2)]
-        loss_chest_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
-        loss_tilde_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
-        loss_data = 0.
-        loss_chest = 0.
-        loss_dict = {
-            "EchoLoss": 0.,
-            "ChLoss": 0.,
-            "LLRLoss": 0.,
-            "Total": 0.,
-        }
-        for _ in tf.range(step, dtype=tf.int64):
-            num_tx = num_tx_sampler(())
+#         bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+2)]
+#         loss_chest_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
+#         loss_tilde_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
+#         loss_data = 0.
+#         loss_chest = 0.
+#         loss_dict = {
+#             "EchoLoss": 0.,
+#             "ChLoss": 0.,
+#             "LLRLoss": 0.,
+#             "Total": 0.,
+#         }
+#         for _ in tf.range(step, dtype=tf.int64):
+#             num_tx = num_tx_sampler(())
 
-            # sample MCS per-UE
-            mcs_arr_training_idx_ = tf.constant(mcs_arr_training_idx, dtype=tf.int32)
-            if mcs_training_probs is None:
-                mcs_arr_idx = tf.random.uniform((batch_size, max_num_tx),
-                                                maxval=len(mcs_arr_training_idx),
-                                                dtype=tf.int32)
-                mcs_arr_idx = tf.gather(mcs_arr_training_idx_, indices=mcs_arr_idx)
-            else:
-                mcs_probs = tf.constant(mcs_training_probs, dtype=tf.float32)
-                mcs_probs = tf.gather(mcs_probs, indices=[num_tx - min_num_tx], axis=0)
-                mcs_probs_ = tf.concat([[0.0], tf.squeeze(mcs_probs)], axis=0)
-                mcs_cdf = tf.math.cumsum(mcs_probs_ / tf.reduce_sum(mcs_probs_))
-                rand_samples = tf.random.uniform((batch_size, max_num_tx), maxval=1.0, dtype=tf.float32)
-                condition = tf.logical_and(
-                    tf.greater_equal(expand_to_rank(rand_samples, 3, axis=-1),
-                                     expand_to_rank(mcs_cdf[:-1], 3, axis=0)),
-                    tf.less(expand_to_rank(rand_samples, 3, axis=-1),
-                            expand_to_rank(mcs_cdf[1:], 3, axis=0)))
-                mcs_arr_idx = expand_to_rank(mcs_arr_training_idx, 3, axis=0) * tf.cast(condition, dtype=tf.int32)
-                mcs_arr_idx = tf.reduce_sum(mcs_arr_idx, axis=-1)
+#             # sample MCS per-UE
+#             mcs_arr_training_idx_ = tf.constant(mcs_arr_training_idx, dtype=tf.int32)
+#             if mcs_training_probs is None:
+#                 mcs_arr_idx = tf.random.uniform((batch_size, max_num_tx),
+#                                                 maxval=len(mcs_arr_training_idx),
+#                                                 dtype=tf.int32)
+#                 mcs_arr_idx = tf.gather(mcs_arr_training_idx_, indices=mcs_arr_idx)
+#             else:
+#                 mcs_probs = tf.constant(mcs_training_probs, dtype=tf.float32)
+#                 mcs_probs = tf.gather(mcs_probs, indices=[num_tx - min_num_tx], axis=0)
+#                 mcs_probs_ = tf.concat([[0.0], tf.squeeze(mcs_probs)], axis=0)
+#                 mcs_cdf = tf.math.cumsum(mcs_probs_ / tf.reduce_sum(mcs_probs_))
+#                 rand_samples = tf.random.uniform((batch_size, max_num_tx), maxval=1.0, dtype=tf.float32)
+#                 condition = tf.logical_and(
+#                     tf.greater_equal(expand_to_rank(rand_samples, 3, axis=-1),
+#                                      expand_to_rank(mcs_cdf[:-1], 3, axis=0)),
+#                     tf.less(expand_to_rank(rand_samples, 3, axis=-1),
+#                             expand_to_rank(mcs_cdf[1:], 3, axis=0)))
+#                 mcs_arr_idx = expand_to_rank(mcs_arr_training_idx, 3, axis=0) * tf.cast(condition, dtype=tf.int32)
+#                 mcs_arr_idx = tf.reduce_sum(mcs_arr_idx, axis=-1)
 
-            # one-hot MCS
-            mcs_ue_mask = tf.one_hot(mcs_arr_idx, depth=len(sys_parameters.mcs_index))
+#             # one-hot MCS
+#             mcs_ue_mask = tf.one_hot(mcs_arr_idx, depth=len(sys_parameters.mcs_index))
 
-            # SNR sampling
-            snr_db = tf.random.uniform(shape=[batch_size],
-                                       minval=min_snr_db[num_tx - min_num_tx],
-                                       maxval=max_snr_db[num_tx - min_num_tx])
+#             # SNR sampling
+#             snr_db = tf.random.uniform(shape=[batch_size],
+#                                        minval=min_snr_db[num_tx - min_num_tx],
+#                                        maxval=max_snr_db[num_tx - min_num_tx])
 
-            # MCS-specific SNR offsets
-            if mcs_training_snr_db_offset is not None:
-                _mcs_training_snr_db_offsets = tf.gather(mcs_training_snr_db_offset, indices=[num_tx-1], axis=0)
-                _mcs_training_snr_db_offsets = tf.squeeze(tf.gather(_mcs_training_snr_db_offsets, indices=mcs_arr_idx, axis=1))
-                active_dmrs = model._active_dmrs_mask(batch_size, num_tx, sys_parameters.max_num_tx)
-                _mcs_training_snr_db_offsets *= active_dmrs
-                _mcs_training_snr_db_offsets = tf.reduce_sum(_mcs_training_snr_db_offsets, axis=1)
-                snr_db += _mcs_training_snr_db_offsets
-            else:
-                active_dmrs = None
+#             # MCS-specific SNR offsets
+#             if mcs_training_snr_db_offset is not None:
+#                 _mcs_training_snr_db_offsets = tf.gather(mcs_training_snr_db_offset, indices=[num_tx-1], axis=0)
+#                 _mcs_training_snr_db_offsets = tf.squeeze(tf.gather(_mcs_training_snr_db_offsets, indices=mcs_arr_idx, axis=1))
+#                 active_dmrs = model._active_dmrs_mask(batch_size, num_tx, sys_parameters.max_num_tx)
+#                 _mcs_training_snr_db_offsets *= active_dmrs
+#                 _mcs_training_snr_db_offsets = tf.reduce_sum(_mcs_training_snr_db_offsets, axis=1)
+#                 snr_db += _mcs_training_snr_db_offsets
+#             else:
+#                 active_dmrs = None
 
-            g1, g2 = weighting_double_readout[0], weighting_double_readout[1]
-            with tf.GradientTape() as tape:
-                # if sys_parameters.system=='mdx':
-                #     loss_data, loss_chest, bce_rel, loss_chest_all, loss_tilde, loss_tilde_all = model(
-                #         batch_size, snr_db, num_tx, mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
-                #     loss = loss_data + g1*loss_chest if double_readout else loss_data
+#             g1, g2 = weighting_double_readout[0], weighting_double_readout[1]
+#             with tf.GradientTape() as tape:
+#                 # if sys_parameters.system=='mdx':
+#                 #     loss_data, loss_chest, bce_rel, loss_chest_all, loss_tilde, loss_tilde_all = model(
+#                 #         batch_size, snr_db, num_tx, mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
+#                 #     loss = loss_data + g1*loss_chest if double_readout else loss_data
 
-                if sys_parameters.system=='nrx':
-                    loss_data, loss_chest = model(batch_size, snr_db, num_tx,
-                                                  mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
-                    loss = loss_data + g1*loss_chest if double_readout else loss_data
+#                 if sys_parameters.system=='nrx':
+#                     loss_data, loss_chest = model(batch_size, snr_db, num_tx,
+#                                                   mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
+#                     loss = loss_data + g1*loss_chest if double_readout else loss_data
 
-                elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                    loss_dict = model(batch_size, snr_db, num_tx,
-                                      mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
-                    loss = loss_dict["Total"]
+#                 elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#                     loss_dict = model(batch_size, snr_db, num_tx,
+#                                       mcs_ue_mask=mcs_ue_mask, active_dmrs=active_dmrs)
+#                     loss = loss_dict["Total"]
 
-                else:
-                    raise NotImplementedError(f"System type '{sys_parameters.system}' is not implemented.")
+#                 else:
+#                     raise NotImplementedError(f"System type '{sys_parameters.system}' is not implemented.")
 
-            grads = tape.gradient(loss, model.trainable_weights)
-            if lr_muls is None:
-                optimizer.apply_gradients(zip(grads, model.trainable_weights))
-            else:
-                scaled_grads = [g * m if g is not None else None for g, m in zip(grads, lr_muls)]
-                optimizer.apply_gradients(zip(scaled_grads, model.trainable_weights))
+#             grads = tape.gradient(loss, model.trainable_weights)
+#             if lr_muls is None:
+#                 optimizer.apply_gradients(zip(grads, model.trainable_weights))
+#             else:
+#                 scaled_grads = [g * m if g is not None else None for g, m in zip(grads, lr_muls)]
+#                 optimizer.apply_gradients(zip(scaled_grads, model.trainable_weights))
 
-        if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-            return loss_dict
-        # if sys_parameters.system=='mdx':
-        #     return loss_data, loss_chest, loss, bce_rel, loss_chest_all
-        if sys_parameters.system=='nrx':
-            return loss_data, loss_chest, loss
+#         if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#             return loss_dict
+#         # if sys_parameters.system=='mdx':
+#         #     return loss_data, loss_chest, loss, bce_rel, loss_chest_all
+#         if sys_parameters.system=='nrx':
+#             return loss_data, loss_chest, loss
 
-    # ----------------------- compiled evaluation step -------------------------
-    @tf.function(jit_compile=xla)
-    def eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx):
-        # if sys_parameters.system=='mdx':
-        #     bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
-        #     loss_chest_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
-        #     loss_tilde_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
-        #     loss_data_mcs, loss_chest, bce_rel, loss_chest_all, loss_tilde, loss_tilde_all = model(
-        #         batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
-        #     return loss_data_mcs, loss_chest, bce_rel, loss_chest_all
+#     # ----------------------- compiled evaluation step -------------------------
+#     @tf.function(jit_compile=xla)
+#     def eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx):
+#         # if sys_parameters.system=='mdx':
+#         #     bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
+#         #     loss_chest_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
+#         #     loss_tilde_all = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
+#         #     loss_data_mcs, loss_chest, bce_rel, loss_chest_all, loss_tilde, loss_tilde_all = model(
+#         #         batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
+#         #     return loss_data_mcs, loss_chest, bce_rel, loss_chest_all
 
-        if sys_parameters.system=='nrx':
-            loss_data_mcs, loss_chest = model(batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
-            return loss_data_mcs, loss_chest
+#         if sys_parameters.system=='nrx':
+#             loss_data_mcs, loss_chest = model(batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
+#             return loss_data_mcs, loss_chest
 
-        if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-            loss_dict = model(batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
-            return loss_dict
+#         if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#             loss_dict = model(batch_size, _snr_db, num_tx=max_num_tx, mcs_arr_eval_idx=mcs_arr_idx)
+#             return loss_dict
 
-    # ------------------- writers: single scalar writer; separate graph/prof ----
-    # DO NOT change training_logdir: all scalar summaries (train/*, eval/*) go here
-    scalar_writer = tf.summary.create_file_writer(training_logdir)
+#     # ------------------- writers: single scalar writer; separate graph/prof ----
+#     # DO NOT change training_logdir: all scalar summaries (train/*, eval/*) go here
+#     scalar_writer = tf.summary.create_file_writer(training_logdir)
 
-    # Graph/trace and profiler go to separate dirs (different files)
-    graph_dir   = training_logdir + "_graph"
-    profile_dir = training_logdir + "_profile"
-    os.makedirs(graph_dir, exist_ok=True)
-    os.makedirs(profile_dir, exist_ok=True)
+#     # Graph/trace and profiler go to separate dirs (different files)
+#     graph_dir   = training_logdir + "_graph"
+#     profile_dir = training_logdir + "_profile"
+#     os.makedirs(graph_dir, exist_ok=True)
+#     os.makedirs(profile_dir, exist_ok=True)
 
-    # Optional: export graph once (separate dir)
-    try:
-        with tf.summary.create_file_writer(graph_dir).as_default():
-            tf.summary.text("config", sys_parameters.config_str, step=0)
-            tf.summary.trace_on(graph=True, profiler=False)
-            # Make a tiny dry-run trace for the captured graph (no heavy work)
-            tf.summary.trace_export(name="keras_graph", step=0)  # graph files live in graph_dir
-    except Exception as e:
-        print(f"[graph-trace] export failed: {e}")
+#     # Optional: export graph once (separate dir)
+#     try:
+#         with tf.summary.create_file_writer(graph_dir).as_default():
+#             tf.summary.text("config", sys_parameters.config_str, step=0)
+#             tf.summary.trace_on(graph=True, profiler=False)
+#             # Make a tiny dry-run trace for the captured graph (no heavy work)
+#             tf.summary.trace_export(name="keras_graph", step=0)  # graph files live in graph_dir
+#     except Exception as e:
+#         print(f"[graph-trace] export failed: {e}")
 
-    # Profiler controller (short window at start if requested)
-    profile_k_steps = int(getattr(sys_parameters, "profile_k_steps", 0))  # e.g., set to 200 to profile first 200 steps
-    profiler = _MaybeProfiler(profile_dir, start=(profile_k_steps > 0))
+#     # Profiler controller (short window at start if requested)
+#     profile_k_steps = int(getattr(sys_parameters, "profile_k_steps", 0))  # e.g., set to 200 to profile first 200 steps
+#     profiler = _MaybeProfiler(profile_dir, start=(profile_k_steps > 0))
 
-    # ------------------------------- outer loop -------------------------------
-    global_iter = 0  # python int for clean summary steps
+#     # ------------------------------- outer loop -------------------------------
+#     global_iter = 0  # python int for clean summary steps
 
-    # Write config as text into the scalar run once (same single event file/dir)
-    with scalar_writer.as_default():
-        tf.summary.text("config", sys_parameters.config_str, step=0)
+#     # Write config as text into the scalar run once (same single event file/dir)
+#     with scalar_writer.as_default():
+#         tf.summary.text("config", sys_parameters.config_str, step=0)
 
-    for i, num_iterations in enumerate(training_schedule["num_iter"]):
-        num_iterations = int(num_iterations)
-        lr = training_schedule["learning_rate"][i]
-        batch_size = training_schedule["batch_size"][i]
-        train_tx = training_schedule["train_tx"][i]
-        double_readout = training_schedule["double_readout"][i]
-        apply_multiloss = training_schedule["apply_multiloss"][i]
-        weighting_double_readout = tf.constant(training_schedule["weighting_double_readout"][i], tf.float32)
+#     for i, num_iterations in enumerate(training_schedule["num_iter"]):
+#         num_iterations = int(num_iterations)
+#         lr = training_schedule["learning_rate"][i]
+#         batch_size = training_schedule["batch_size"][i]
+#         train_tx = training_schedule["train_tx"][i]
+#         double_readout = training_schedule["double_readout"][i]
+#         apply_multiloss = training_schedule["apply_multiloss"][i]
+#         weighting_double_readout = tf.constant(training_schedule["weighting_double_readout"][i], tf.float32)
 
-        min_snr_db = tf.constant(training_schedule["min_training_snr_db"][i], tf.float32)
-        max_snr_db = tf.constant(training_schedule["max_training_snr_db"][i], tf.float32)
+#         min_snr_db = tf.constant(training_schedule["min_training_snr_db"][i], tf.float32)
+#         max_snr_db = tf.constant(training_schedule["max_training_snr_db"][i], tf.float32)
 
-        # CGNN steps (kept same behavior)
-        if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-            cgnn_step = -1
-        else:
-            if "cgnn_steps" in training_schedule:
-                cgnn_step = int(training_schedule["cgnn_steps"][i])
-                # if cgnn_step > 0:
-                #     model._receiver._neural_rx.num_it = 1
-                # if cgnn_step == 0:
-                #     model._receiver._neural_rx.num_it = np.random.randint(1, sys_parameters.num_nrx_iter + 1)
-                # if cgnn_step == -1:
-                #     model._receiver._neural_rx.num_it = sys_parameters.num_nrx_iter
-            else:
-                # model._receiver._neural_rx.num_it = sys_parameters.num_nrx_iter
-                cgnn_step = -1
+#         # CGNN steps (kept same behavior)
+#         if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#             cgnn_step = -1
+#         else:
+#             if "cgnn_steps" in training_schedule:
+#                 cgnn_step = int(training_schedule["cgnn_steps"][i])
+#                 # if cgnn_step > 0:
+#                 #     model._receiver._neural_rx.num_it = 1
+#                 # if cgnn_step == 0:
+#                 #     model._receiver._neural_rx.num_it = np.random.randint(1, sys_parameters.num_nrx_iter + 1)
+#                 # if cgnn_step == -1:
+#                 #     model._receiver._neural_rx.num_it = sys_parameters.num_nrx_iter
+#             else:
+#                 # model._receiver._neural_rx.num_it = sys_parameters.num_nrx_iter
+#                 cgnn_step = -1
 
-        num_it, git = 1, 0
+#         num_it, git = 1, 0
 
-        # Optional transfer learning lr multipliers
-        lr_muls = None
-        if transfer_loaded and hasattr(sys_parameters, 'lr_mul'):
-            lr_mul = sys_parameters.lr_mul[i]
-            lr_muls = compute_lr_multipliers(
-                model, sys_parameters.transfer_weights_path,
-                start_token="neural_pusch_receiver/cgnnofdm",
-                lr_m=lr_mul
-            )
+#         # Optional transfer learning lr multipliers
+#         lr_muls = None
+#         if transfer_loaded and hasattr(sys_parameters, 'lr_mul'):
+#             lr_mul = sys_parameters.lr_mul[i]
+#             lr_muls = compute_lr_multipliers(
+#                 model, sys_parameters.transfer_weights_path,
+#                 start_token="neural_pusch_receiver/cgnnofdm",
+#                 lr_m=lr_mul
+#             )
 
-        optimizer.learning_rate.assign(lr)
+#         optimizer.learning_rate.assign(lr)
 
-        # chunked updates
-        step_chunk = getattr(sys_parameters, 'num_iter_step', 100)
-        num_iter_global = num_iterations // getattr(sys_parameters, 'num_iter_train_save', 1000)
-        for _ in range(num_iter_global):
-            # Optional: start profiler at the very beginning window
-            if profiler._enabled and not profiler._started and global_iter == 0:
-                profiler.start()
+#         # chunked updates
+#         step_chunk = getattr(sys_parameters, 'num_iter_step', 100)
+#         num_iter_global = num_iterations // getattr(sys_parameters, 'num_iter_train_save', 1000)
+#         for _ in range(num_iter_global):
+#             # Optional: start profiler at the very beginning window
+#             if profiler._enabled and not profiler._started and global_iter == 0:
+#                 profiler.start()
 
-            # --- perform one "save interval" block, inside which we call compiled chunks
-            loops_this_block = getattr(sys_parameters, 'num_iter_train_save', 1000) // step_chunk
-            for _inner in range(loops_this_block):
-                # mark this chunk for profiler timeline
-                try:
-                    tf.profiler.experimental.Trace('train_chunk',
-                                                   step_num=int(global_iter),
-                                                   _r=1)
-                except Exception:
-                    pass  # Trace is best-effort
+#             # --- perform one "save interval" block, inside which we call compiled chunks
+#             loops_this_block = getattr(sys_parameters, 'num_iter_train_save', 1000) // step_chunk
+#             for _inner in range(loops_this_block):
+#                 # mark this chunk for profiler timeline
+#                 try:
+#                     tf.profiler.experimental.Trace('train_chunk',
+#                                                    step_num=int(global_iter),
+#                                                    _r=1)
+#                 except Exception:
+#                     pass  # Trace is best-effort
 
-                # Run compiled step
-                if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                    loss_out = _compile_step(batch_size, min_snr_db, max_snr_db,
-                                             double_readout, [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
-                                                              weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
-                                             apply_multiloss, train_tx, lr_muls, step_chunk)
-                    loss = loss_out
-                    loss_data = 0.0
-                    loss_chest = 0.0
+#                 # Run compiled step
+#                 if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#                     loss_out = _compile_step(batch_size, min_snr_db, max_snr_db,
+#                                              double_readout, [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
+#                                                               weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
+#                                              apply_multiloss, train_tx, lr_muls, step_chunk)
+#                     loss = loss_out
+#                     loss_data = 0.0
+#                     loss_chest = 0.0
 
-                # elif sys_parameters.system=='mdx':
-                #     loss_data, loss_chest, loss, bce_rel, loss_chest_all = _compile_step(
-                #         batch_size, min_snr_db, max_snr_db,
-                #         double_readout,
-                #         [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
-                #          weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
-                #         apply_multiloss, train_tx, lr_muls, step_chunk)
+#                 # elif sys_parameters.system=='mdx':
+#                 #     loss_data, loss_chest, loss, bce_rel, loss_chest_all = _compile_step(
+#                 #         batch_size, min_snr_db, max_snr_db,
+#                 #         double_readout,
+#                 #         [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
+#                 #          weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
+#                 #         apply_multiloss, train_tx, lr_muls, step_chunk)
 
-                elif sys_parameters.system=='nrx':
-                    loss_data, loss_chest, loss = _compile_step(
-                        batch_size, min_snr_db, max_snr_db,
-                        double_readout,
-                        [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
-                         weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
-                        apply_multiloss, train_tx, lr_muls, step_chunk)
+#                 elif sys_parameters.system=='nrx':
+#                     loss_data, loss_chest, loss = _compile_step(
+#                         batch_size, min_snr_db, max_snr_db,
+#                         double_readout,
+#                         [weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[0],
+#                          weighting_double_readout if tf.size(weighting_double_readout)==1 else weighting_double_readout[1]],
+#                         apply_multiloss, train_tx, lr_muls, step_chunk)
 
-                global_iter += step_chunk
+#                 global_iter += step_chunk
 
-                # --- SCALAR LOGS: single writer (same file/dir), prefixed tags
-                if sys_parameters.system in ( 'nrx'):
-                    _safe_scalar("train/Loss",       loss_data,  global_iter, scalar_writer)
-                    _safe_scalar("train/Loss_ChEst", loss_chest, global_iter, scalar_writer)
-                    _safe_scalar("train/Total_Loss", loss,       global_iter, scalar_writer)
-                    # if sys_parameters.system=='mdx' and isinstance(bce_rel, list):
-                    #     for i_b, v_bce in enumerate(bce_rel):
-                    #         _safe_scalar(f"train/BCE_rel_PerfCh_{i_b}", v_bce, global_iter, scalar_writer)
-                    #     for i_c, v_ch in enumerate(loss_chest_all):
-                    #         _safe_scalar(f"train/CHEst_{i_c}", v_ch, global_iter, scalar_writer)
+#                 # --- SCALAR LOGS: single writer (same file/dir), prefixed tags
+#                 if sys_parameters.system in ( 'nrx'):
+#                     _safe_scalar("train/Loss",       loss_data,  global_iter, scalar_writer)
+#                     _safe_scalar("train/Loss_ChEst", loss_chest, global_iter, scalar_writer)
+#                     _safe_scalar("train/Total_Loss", loss,       global_iter, scalar_writer)
+#                     # if sys_parameters.system=='mdx' and isinstance(bce_rel, list):
+#                     #     for i_b, v_bce in enumerate(bce_rel):
+#                     #         _safe_scalar(f"train/BCE_rel_PerfCh_{i_b}", v_bce, global_iter, scalar_writer)
+#                     #     for i_c, v_ch in enumerate(loss_chest_all):
+#                     #         _safe_scalar(f"train/CHEst_{i_c}", v_ch, global_iter, scalar_writer)
 
-                elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                    for name, value in loss.items():
-                        _safe_scalar(f"train/{name}", value, global_iter, scalar_writer)
+#                 elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#                     for name, value in loss.items():
+#                         _safe_scalar(f"train/{name}", value, global_iter, scalar_writer)
 
-                # --- Optional save / guard on NaN weights
-                if weight_saving_schedule is not None and global_iter in weight_saving_schedule:
-                    print(f"Saving weights after {global_iter} iterations")
-                    save_weights(model, filename + f"_{global_iter}_iter", save_format=save_format)
+#                 # --- Optional save / guard on NaN weights
+#                 if weight_saving_schedule is not None and global_iter in weight_saving_schedule:
+#                     print(f"Saving weights after {global_iter} iterations")
+#                     save_weights(model, filename + f"_{global_iter}_iter", save_format=save_format)
 
-                if all(tf.reduce_all(tf.math.is_finite(w)).numpy() for w in model.weights):
-                    save_weights(model, filename, save_format=save_format)
-                else:
-                    print("Warning: Model contains NaN or Inf weights, not saving.", flush=True)
+#                 if all(tf.reduce_all(tf.math.is_finite(w)).numpy() for w in model.weights):
+#                     save_weights(model, filename, save_format=save_format)
+#                 else:
+#                     print("Warning: Model contains NaN or Inf weights, not saving.", flush=True)
 
-                # --- Eval loop: log into same writer with 'eval/' prefix
-                for mcs_arr_idx in mcs_arr_training_idx:
-                    if not sys_parameters.ebno:
-                        _no = ebnodb2no(
-                            eval_ebno_db_arr[mcs_arr_idx],
-                            model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
-                            model._transmitters[mcs_arr_idx]._target_coderate,
-                            model._transmitters[mcs_arr_idx]._resource_grid)
-                        _snr_db = - 10.0 * tf.math.log(_no) / tf.math.log(10.0)
-                    else:
-                        _snr_db = eval_ebno_db_arr[mcs_arr_idx]
+#                 # --- Eval loop: log into same writer with 'eval/' prefix
+#                 for mcs_arr_idx in mcs_arr_training_idx:
+#                     if not sys_parameters.ebno:
+#                         _no = ebnodb2no(
+#                             eval_ebno_db_arr[mcs_arr_idx],
+#                             model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
+#                             model._transmitters[mcs_arr_idx]._target_coderate,
+#                             model._transmitters[mcs_arr_idx]._resource_grid)
+#                         _snr_db = - 10.0 * tf.math.log(_no) / tf.math.log(10.0)
+#                     else:
+#                         _snr_db = eval_ebno_db_arr[mcs_arr_idx]
 
-                    # if sys_parameters.system=='mdx':
-                    #     loss_data_mcs, loss_chestv, bce_rel_v, loss_chest_all_v = eval_model_xla(
-                    #         batch_size, _snr_db, max_num_tx, mcs_arr_idx)
-                    #     _safe_scalar(f"eval/CE_loss_mcs{mcs_arr_idx}",   loss_data_mcs, global_iter, scalar_writer)
-                    #     _safe_scalar(f"eval/CHEst_loss_mcs{mcs_arr_idx}", loss_chestv,   global_iter, scalar_writer)
-                    #     if isinstance(bce_rel_v, list):
-                    #         for i_b, v_bce in enumerate(bce_rel_v):
-                    #             _safe_scalar(f"eval/BCE_rel_PerfCh_{i_b}_mcs{mcs_arr_idx}", v_bce, global_iter, scalar_writer)
-                    #         for i_c, v_ch in enumerate(loss_chest_all_v):
-                    #             _safe_scalar(f"eval/CHEst_{i_c}_mcs{mcs_arr_idx}", v_ch, global_iter, scalar_writer)
+#                     # if sys_parameters.system=='mdx':
+#                     #     loss_data_mcs, loss_chestv, bce_rel_v, loss_chest_all_v = eval_model_xla(
+#                     #         batch_size, _snr_db, max_num_tx, mcs_arr_idx)
+#                     #     _safe_scalar(f"eval/CE_loss_mcs{mcs_arr_idx}",   loss_data_mcs, global_iter, scalar_writer)
+#                     #     _safe_scalar(f"eval/CHEst_loss_mcs{mcs_arr_idx}", loss_chestv,   global_iter, scalar_writer)
+#                     #     if isinstance(bce_rel_v, list):
+#                     #         for i_b, v_bce in enumerate(bce_rel_v):
+#                     #             _safe_scalar(f"eval/BCE_rel_PerfCh_{i_b}_mcs{mcs_arr_idx}", v_bce, global_iter, scalar_writer)
+#                     #         for i_c, v_ch in enumerate(loss_chest_all_v):
+#                     #             _safe_scalar(f"eval/CHEst_{i_c}_mcs{mcs_arr_idx}", v_ch, global_iter, scalar_writer)
 
-                    if sys_parameters.system=='nrx':
-                        loss_data_mcs, loss_chestv = eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx)
-                        _safe_scalar(f"eval/CE_loss_mcs{mcs_arr_idx}",   loss_data_mcs, global_iter, scalar_writer)
-                        _safe_scalar(f"eval/CHEst_loss_mcs{mcs_arr_idx}", loss_chestv,   global_iter, scalar_writer)
+#                     if sys_parameters.system=='nrx':
+#                         loss_data_mcs, loss_chestv = eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx)
+#                         _safe_scalar(f"eval/CE_loss_mcs{mcs_arr_idx}",   loss_data_mcs, global_iter, scalar_writer)
+#                         _safe_scalar(f"eval/CHEst_loss_mcs{mcs_arr_idx}", loss_chestv,   global_iter, scalar_writer)
 
-                    elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                        loss_dict_mcs = eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx)
-                        for name, value in loss_dict_mcs.items():
-                            _safe_scalar(f"eval/{name}_mcs{mcs_arr_idx}", value, global_iter, scalar_writer)
+#                     elif sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+#                         loss_dict_mcs = eval_model_xla(batch_size, _snr_db, max_num_tx, mcs_arr_idx)
+#                         for name, value in loss_dict_mcs.items():
+#                             _safe_scalar(f"eval/{name}_mcs{mcs_arr_idx}", value, global_iter, scalar_writer)
 
-                # ---- CGNN iteration schedule (unchanged logic)
-                # if not sys_parameters.system=='deep_echo':
-                #     if cgnn_step > 0:
-                #         if model._receiver._neural_rx.num_it + 1 <= sys_parameters.num_nrx_iter:
-                #             model._receiver._neural_rx.num_it += 1
-                #         else:
-                #             model._receiver._neural_rx.num_it = 1
-                #     if cgnn_step == 0:
-                #         model._receiver._neural_rx.num_it = np.random.randint(1, sys_parameters.num_nrx_iter + 1)
+#                 # ---- CGNN iteration schedule (unchanged logic)
+#                 # if not sys_parameters.system=='deep_echo':
+#                 #     if cgnn_step > 0:
+#                 #         if model._receiver._neural_rx.num_it + 1 <= sys_parameters.num_nrx_iter:
+#                 #             model._receiver._neural_rx.num_it += 1
+#                 #         else:
+#                 #             model._receiver._neural_rx.num_it = 1
+#                 #     if cgnn_step == 0:
+#                 #         model._receiver._neural_rx.num_it = np.random.randint(1, sys_parameters.num_nrx_iter + 1)
 
-                # Stop profiler after first window if requested
-                if profiler._enabled and profiler._started and global_iter >= profile_k_steps:
-                    profiler.stop()
+#                 # Stop profiler after first window if requested
+#                 if profiler._enabled and profiler._started and global_iter >= profile_k_steps:
+#                     profiler.stop()
 
-    # Make sure profiler is stopped
-    profiler.stop()
+#     # Make sure profiler is stopped
+#     profiler.stop()
 
 # ________________________________________________________________________
 # -----------------------End Training Loop--------------------------------
