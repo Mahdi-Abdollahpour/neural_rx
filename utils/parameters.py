@@ -640,6 +640,7 @@ class Parameters:
                                     training=self._training,
                                     num_tx=self.max_num_tx,
                                     random_subsampling=False,
+                                    prbs=self.n_size_bwp,
                                     )
 
             self.channel = OFDMDatasetChannel(self.channel_model,

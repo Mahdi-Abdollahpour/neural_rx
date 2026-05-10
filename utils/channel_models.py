@@ -648,6 +648,39 @@ class OFDMDatasetChannelSampler(ChannelModel):
         [num_examples, num_rx, num_rx_ant, num_tx, num_tx_ant,
          num_ofdm_symbols, fft_size]
 
+    Parameters
+    ----------
+    mat_filename : str
+        Path to the MATLAB ``.mat`` file containing the precomputed channel
+        dataset. Both standard MAT files and MATLAB v7.3 / HDF5 files are
+        supported.
+    max_num_examples : int, optional
+        Maximum number of channel examples to load from the file.
+        ``-1`` (default) loads all available examples.
+    training : bool, optional
+        If ``True`` (default), the dataset is split into ``num_tx`` equal
+        subsets and each subset is independently sampled per transmitter.
+        If ``False``, examples are drawn in an interleaved pattern across
+        transmitters (evaluation mode).
+    num_tx : int, optional
+        Number of transmit users / streams. Default is ``1``.
+    random_subsampling : bool, optional
+        If ``True`` (default), a fresh random batch of indices is drawn for
+        every call. If ``False``, the same index vector is reused across all
+        transmitter subsets within one call, producing correlated samples.
+    dataset_name : str, optional
+        Key used to look up the channel tensor inside the MAT file.
+        Default is ``"h_freq"``.
+    prbs : int or None, optional
+        Number of Physical Resource Blocks to retain in the frequency
+        dimension. One PRB spans 12 consecutive subcarriers (LTE/NR
+        standard). When set, only the first ``prbs * 12`` subcarriers are
+        kept; the slice is applied once at load time to reduce memory usage.
+        ``None`` (default) keeps the full ``fft_size``.
+    dtype : tf.DType, optional
+        TensorFlow data type for the channel tensor. Default is
+        ``tf.complex64``.
+
     Notes
     -----
     - Standard MATLAB ``.mat`` files are read with ``scipy.io.loadmat``.
@@ -658,7 +691,7 @@ class OFDMDatasetChannelSampler(ChannelModel):
     - The runtime sampling path in ``__call__`` is TensorFlow graph compatible.
     - This class returns OFDM frequency-domain channels directly, not ``a`` and ``tau``.
     """
-
+    
     def __init__(self,
                  mat_filename,
                  max_num_examples=-1,
@@ -666,6 +699,7 @@ class OFDMDatasetChannelSampler(ChannelModel):
                  num_tx=1,
                  random_subsampling=True,
                  dataset_name="h_freq",
+                 prbs=None,
                  dtype=tf.complex64):
         self._training = training
         self._num_tx = num_tx
@@ -678,6 +712,21 @@ class OFDMDatasetChannelSampler(ChannelModel):
 
         # Ensure dtype expected by the simulator
         h_freq = tf.cast(h_freq, self._dtype)
+
+        # PRB slicing: 1 PRB = 12 subcarriers (LTE/NR standard)
+        if prbs is not None:
+            fft_size = int(h_freq.shape[-1])
+            if fft_size % 12 != 0:
+                raise ValueError(
+                    f"fft_size {fft_size} is not divisible by 12 (subcarriers per PRB)."
+                )
+            max_prbs = fft_size // 12
+            if prbs > max_prbs:
+                raise ValueError(
+                    f"Requested {prbs} PRBs but dataset only has {max_prbs} PRBs "
+                    f"({fft_size} subcarriers)."
+                )
+            h_freq = h_freq[..., :prbs * 12]
 
         # h_freq shape:
         # [N, num_rx, num_rx_ant, num_tx, num_tx_ant, num_ofdm_symbols, fft_size]
