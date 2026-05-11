@@ -770,6 +770,22 @@ class OFDMDatasetChannelSampler(ChannelModel):
             return value.decode()
         return value
 
+    @staticmethod
+    def _slice_max_examples(h, max_num_examples, mat_filename, dataset_name):
+        if max_num_examples == -1:
+            return h
+
+        num_examples = h.shape[0]
+        if max_num_examples > num_examples:
+            print(
+                f"Warning: requested max_num_examples={max_num_examples}, but "
+                f"dataset '{dataset_name}' in '{mat_filename}' only contains "
+                f"{num_examples} examples. Loading all available examples."
+            )
+            return h
+
+        return h[:max_num_examples]
+
     @classmethod
     def _load_mat_complex(cls, mat_filename, dataset_name="h_freq", max_num_examples=-1):
         """Load a complex OFDM channel tensor from MATLAB MAT files.
@@ -794,8 +810,9 @@ class OFDMDatasetChannelSampler(ChannelModel):
                     raise ValueError(
                         f"Expected 7-D tensor for '{dataset_name}', got shape {h.shape}"
                     )
-                if max_num_examples != -1:
-                    h = h[:max_num_examples]
+                h = cls._slice_max_examples(
+                    h, max_num_examples, mat_filename, dataset_name
+                )
             except Exception as exc:  # fallback to HDF5/v7.3 reader if needed
                 errors.append(exc)
                 h = None
@@ -824,8 +841,9 @@ class OFDMDatasetChannelSampler(ChannelModel):
                     # Convert to:
                     #   (batch, num_rx, num_rx_ant, num_tx, num_tx_ant, num_sym, fft_size)
                     h = np.transpose(h, (6, 5, 4, 3, 2, 1, 0))
-                if max_num_examples != -1:
-                    h = h[:max_num_examples]
+                h = cls._slice_max_examples(
+                    h, max_num_examples, mat_filename, dataset_name
+                )
             except Exception as exc:
                 errors.append(exc)
                 h = None

@@ -178,6 +178,7 @@ class Parameters:
         if not training:
             # self.channel_type = channel_type_eval
             if hasattr(self, 'mat_filename') and mat_filename_eval is not None:
+                print(f"mat_filename:{self.mat_filename}, \n changed to eval mat_filename:{mat_filename_eval}")
                 self.mat_filename = mat_filename_eval
             self.n_size_bwp = self.n_size_bwp_eval
             self.max_ut_velocity = self.max_ut_velocity_eval
@@ -629,14 +630,18 @@ class Parameters:
                                        add_awgn=True,
                                        normalize_channel=self.channel_norm,
                                        return_channel=True)
-        elif self.channel_type == "OFDMDataset": #TODO 
-
-            file_path = os.path.join("..", "data", self.mat_filename)
+            
+        elif self.channel_type == "OFDMDataset":
+            if os.path.isabs(self.mat_filename):
+                file_path = self.mat_filename
+            else:
+                file_path = os.path.join("..", "data", self.mat_filename)
+            
             if not os.path.exists(file_path):
                 raise FileNotFoundError(f"File not found: {file_path}")
             
             self.channel_model = OFDMDatasetChannelSampler(file_path,
-                                    max_num_examples=-1, # loads entire dataset
+                                    max_num_examples=getattr(self, "max_num_examples", -1),
                                     training=self._training,
                                     num_tx=self.max_num_tx,
                                     random_subsampling=False,
