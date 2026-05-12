@@ -1019,21 +1019,41 @@ class OFDMDatasetChannel(Layer):
                                                 tf.as_dtype(self.dtype))
 
     def _normalize_h_freq(self, h_freq):
-        """Match Sionna's cir_to_ofdm_channel normalization on loaded OFDM data."""
+        """Match Sionna's cir_to_ofdm_channel normalization on loaded OFDM data.
+
+        Input
+        -----
+        h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant,
+                  num_ofdm_symbols, fft_size], tf.complex
+            Channel frequency responses.
+
+        Output
+        ------
+        h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant,
+                  num_ofdm_symbols, fft_size], tf.complex
+            Channel frequency responses normalized to unit average energy per
+            RX/TX link.
+        """
+        # Shapes: B=batch, R=num_rx, RA=num_rx_ant, T=num_tx, TA=num_tx_ant,
+        # S=num_ofdm_symbols, F=fft_size
+        # h_freq: [B, R, RA, T, TA, S, F]
         rank = h_freq.shape.rank
         if rank is None:
+            # Average over RA, TA, S, and F for dynamic-rank tensors.
             reduce_axes = (2, 4, 5, 6)
         else:
             # Keep batch, RX, and TX link axes and average over every other
             # dimension so each sampled link has unit average energy.
             reduce_axes = tuple(axis for axis in range(rank) if axis not in (0, 1, 3))
 
+        # scale: [B, R, 1, T, 1, 1, 1]
         scale = tf.reduce_mean(
             tf.square(tf.abs(h_freq)),
             axis=reduce_axes,
             keepdims=True,
         )
         scale = tf.cast(tf.sqrt(scale), h_freq.dtype)
+        # return: [B, R, RA, T, TA, S, F]
         return tf.math.divide_no_nan(h_freq, scale)
 
     def call(self, inputs):
