@@ -239,6 +239,185 @@ class NTDLChannel(tf.keras.layers.Layer):
         return y, h
 
 
+class NCDLChannel(tf.keras.layers.Layer):
+    """
+    Channel model that stacks N independent 3GPP CDL links. Sionna's CDL is
+    defined for a single transmitter and a single receiver, so an N user
+    system is built by instantiating one CDL per user and concatenating the
+    frequency responses along the num_tx axis (same approach as
+    :class:`NTDLChannel`).
+
+    Unlike the TDL-based models, the spatial correlation is not injected via
+    Kronecker correlation matrices but follows from the antenna array
+    geometry, hence ``bs_array``/``ut_array`` are required instead of
+    ``num_rx_ant``/``num_tx_ant``.
+
+    Parameters
+    ---------
+    carrier_frequency: float
+        Carrier frequency of the simulation.
+
+    resource_grid: ResourceGrid
+        Resource grid used for the simulation.
+
+    bs_array: PanelArray
+        Base station antenna array. Defines num_rx_ant.
+
+    ut_array: PanelArray
+        User terminal antenna array. Defines num_tx_ant.
+
+    max_num_tx: int
+        Maximum number of users. ``cdl_models`` is tiled to at least this
+        length.
+
+    norm_channel: bool
+        If True, the channel is normalized.
+
+    cdl_models: list of str
+        CDL profiles to draw from, each one of "A", "B", "C", "D", "E".
+
+    min_speed / max_speed: float
+        UT velocity range in m/s.
+
+    delay_spread_min / delay_spread_max: float
+        Delay spread range in nano seconds. Resampled for every call.
+
+    spread_ut_orientation: bool
+        CDL cluster angles are fixed per profile, so several users sharing a
+        profile would also share their angular signature and be hard to
+        separate. If True (default), each user gets a distinct UT azimuth
+        spread over [0, 2*pi). Set to False for textbook CDL. For a single
+        user this is a no-op (the sionna default orientation is used).
+
+    Input
+    -----
+
+    (x, no):
+        Tuple:
+
+    x :  [batch size, num_tx, num_tx_ant, num_ofdm_symbols, fft_size],
+         tf.complex
+        Channel inputs
+
+    no : Scalar or Tensor, tf.float
+        Scalar or tensor whose shape can be broadcast to the shape of the
+        channel outputs
+
+    Output
+    -------
+    y : [batch size, num_rx, num_rx_ant, num_ofdm_symbols, fft_size], tf.complex
+        Channel outputs
+    h_freq : [batch size, num_rx, num_rx_ant, num_tx, num_tx_ant,
+              num_ofdm_symbols, fft_size], tf.complex
+        Channel frequency responses.
+    """
+    def __init__(self,
+                 carrier_frequency,
+                 resource_grid,
+                 bs_array,
+                 ut_array,
+                 max_num_tx=4,
+                 norm_channel=False,
+                 cdl_models=["A"],  # A, B, C, D, E
+                 min_speed=0.,
+                 max_speed=34.,
+                 delay_spread_min=10,   # in nano seconds
+                 delay_spread_max=300,  # in nano seconds
+                 spread_ut_orientation=True,
+                 ):
+        super().__init__()
+
+        for model in cdl_models:
+            assert model in ("A", "B", "C", "D", "E"), \
+                f"Invalid CDL model '{model}', expected one of A, B, C, D, E."
+
+        print(f"\n\tLoading NCDL {cdl_models}.\n")
+
+        self._max_num_tx = max_num_tx
+        self._delay_spread_min = delay_spread_min
+        self._delay_spread_max = delay_spread_max
+        self._carrier_frequency = carrier_frequency
+        self._cdl_models = cdl_models
+        self._resource_grid = resource_grid
+        self._norm_channel = norm_channel
+        self._apply_channel = ApplyOFDMChannel()
+
+        if len(cdl_models) < max_num_tx:
+            # Repeat the list so that its length covers max_num_tx
+            repeat_times = (max_num_tx // len(cdl_models)) + 1
+            cdl_models = cdl_models * repeat_times
+
+        num_links = len(cdl_models)
+
+        self._gens = []
+        for idx, model in enumerate(cdl_models):
+
+            delay_spread = delay_spread_max * 1e-9  # seconds
+
+            # Sionna's default is [PI, 0, 0] (UT facing the BS); index 0 keeps
+            # it so that a single-user setup reproduces textbook CDL exactly.
+            if spread_ut_orientation and num_links > 1:
+                azimuth = np.pi + 2. * np.pi * idx / num_links
+                ut_orientation = tf.constant([azimuth, 0., 0.], tf.float32)
+            else:
+                ut_orientation = None
+
+            cdl = CDL(model=model,
+                      delay_spread=delay_spread,
+                      carrier_frequency=self._carrier_frequency,
+                      ut_array=ut_array,
+                      bs_array=bs_array,
+                      direction='uplink',
+                      ut_orientation=ut_orientation,
+                      min_speed=min_speed,
+                      max_speed=max_speed)
+
+            gen_channel = GenerateOFDMChannel_(
+                cdl,
+                self._resource_grid,
+                normalize_channel=self._norm_channel
+            )
+            self._gens.append(gen_channel)
+
+    def call(self, inputs):
+
+        x, no = inputs
+        size = tf.shape(x)
+        batch_size = size[0]
+        num_tx = size[1]
+
+        k = len(self._gens)
+
+        # Compute all links, each with its own random delay spread
+        outputs = [
+            gen(
+                batch_size,
+                delay_spread=tf.random.uniform(
+                    shape=(),
+                    minval=self._delay_spread_min,
+                    maxval=self._delay_spread_max,
+                    dtype=tf.float32
+                ) * 1e-9  # nano seconds
+            )
+            for gen in self._gens
+        ]
+
+        all_outputs = tf.stack(outputs, axis=0)
+
+        # Randomly assign links to the active users
+        indices = tf.range(k)
+        shuffled_indices = tf.random.shuffle(indices)
+        selected_indices = shuffled_indices[:num_tx]
+        selected_outputs = tf.gather(all_outputs, selected_indices, axis=0)
+
+        h_list = tf.unstack(selected_outputs, axis=0)
+
+        # Concatenate along the num_tx axis
+        h = tf.concat(h_list, axis=3)
+        y = self._apply_channel([x, h, no])
+        return y, h
+
+
 
 
 

@@ -21,8 +21,24 @@ from sionna.nr import PUSCHConfig, PUSCHDMRSConfig, TBConfig, CarrierConfig, PUS
 from sionna.channel.tr38901 import PanelArray, UMi, TDL, UMa
 from sionna.mimo import StreamManagement
 from sionna.channel import OFDMChannel, AWGN
-from .channel_models import DoubleTDLChannel, DatasetChannel, NTDLChannel, OFDMDatasetChannel, OFDMDatasetChannelSampler
+from .channel_models import DoubleTDLChannel, DatasetChannel, NTDLChannel, NCDLChannel, OFDMDatasetChannel, OFDMDatasetChannelSampler
 from .impairments import FrequencyOffset
+
+def resolve_channel_models(*candidates):
+    """Pick the first non-empty model list among ``candidates`` and normalize it.
+
+    The TDL and CDL families share the same profile letters (A..E), so a single
+    list selects the profiles for whichever family ``channel_type`` picks.
+    Entries may carry a redundant "TDL-"/"CDL-" prefix (e.g. "CDL-B"), which is
+    stripped. Returns None if every candidate is empty.
+    """
+    for models in candidates:
+        if models:
+            return [m.split("-", 1)[1]
+                    if m.upper().startswith(("TDL-", "CDL-")) else m
+                    for m in models]
+    return None
+
 
 class Parameters:
     r"""
@@ -142,7 +158,8 @@ class Parameters:
                 n_size_bwp_eval=None, batch_size_eval=None, batch_size_eval_small=None,
                 max_ut_velocity_eval=None, min_ut_velocity_eval=None,
                 channel_norm_eval=None, mat_filename_eval=None,
-                channel_type_eval=None, tdl_models=None): # Just a fast solution
+                channel_type_eval=None, channel_models=None,
+                tdl_models=None, cdl_models=None): # Just a fast solution
 
 
 
@@ -340,16 +357,22 @@ class Parameters:
         # ##############################
         # ##### Initialize Channel #####
         # ##############################
-        self.tdl_models = ["A"]
+        self.channel_models = ["A"]
         self._pc = pc
 
-        
+        # One list of profile letters serves both the TDL and the CDL family;
+        # -tdl_models / -cdl_models are kept as aliases of -channel_models.
+        channel_models = resolve_channel_models(channel_models, cdl_models,
+                                                tdl_models)
+        if channel_models is not None:
+            self.channel_models = channel_models
+        # Legacy attribute names
+        self.tdl_models = self.channel_models
+        self.cdl_models = self.channel_models
 
-        if tdl_models is not None:
-            self.tdl_models = tdl_models
         if channel_type_eval is not None:
             self.initialize_channel(compute_cov=compute_cov, channel_type_eval=channel_type_eval,
-                                    tdl_models=tdl_models)
+                                    channel_models=channel_models)
         else:
             self.initialize_channel(compute_cov=compute_cov)
 
@@ -466,7 +489,8 @@ class Parameters:
 
         return bs_array, ut_array
 
-    def initialize_channel(self,channel_type_eval=None, tdl_models=None, compute_cov=False,
+    def initialize_channel(self,channel_type_eval=None, channel_models=None,
+                                tdl_models=None, cdl_models=None, compute_cov=False,
                                 delay_spread_min=10,   # in nano seconds
                                 delay_spread_max=300,  # in nano seconds
                                 doppler_shift_max=325  # Hz
@@ -502,8 +526,13 @@ class Parameters:
 
         if channel_type_eval is not None:
             self.channel_type = channel_type_eval
-        if tdl_models is not None:
-            self.tdl_models = tdl_models
+        channel_models = resolve_channel_models(channel_models, cdl_models,
+                                                tdl_models)
+        if channel_models is not None:
+            self.channel_models = channel_models
+            # Legacy attribute names
+            self.tdl_models = self.channel_models
+            self.cdl_models = self.channel_models
         # always use UMi to calculate covariance matrix
         if compute_cov:
             # if not self.channel_type in ("UMi", "UMa", "OFDMDataset"): # use UMa if selected, use dataset if selected
@@ -623,11 +652,37 @@ class Parameters:
                                     num_rx_ant = self.num_rx_antennas,
                                     max_num_tx = self.max_num_tx,
                                     norm_channel=self.channel_norm,
-                                    tdl_models=self.tdl_models,
+                                    tdl_models=self.channel_models,
                                     delay_spread_min=delay_spread_min,   # in nano seconds
                                     delay_spread_max=delay_spread_max,  # in nano seconds
                                     doppler_shift_max=doppler_shift_max  # Hz
                                     )
+
+
+        # CDL for evaluation. "CDL-A" .. "CDL-E" select a single profile
+        # (matching the "TDL-B100"/"TDL-C300" naming), plain "CDL" draws the
+        # per-user profiles from self.channel_models.
+        elif self.channel_type == "CDL" or self.channel_type.startswith("CDL-"):
+            if self.channel_type.startswith("CDL-"):
+                cdl_models_ = [self.channel_type.split("-", 1)[1]]
+            else:
+                cdl_models_ = self.channel_models
+
+            bs_array, ut_array = self._build_panel_arrays()
+
+            self.channel = NCDLChannel(
+                            carrier_frequency=self.carrier_frequency,
+                            resource_grid=self.transmitters[0].resource_grid,    # resource grid is independent of MCS
+                            bs_array=bs_array,
+                            ut_array=ut_array,
+                            max_num_tx=self.max_num_tx,
+                            norm_channel=self.channel_norm,
+                            cdl_models=cdl_models_,
+                            min_speed=self.min_ut_velocity,
+                            max_speed=self.max_ut_velocity,
+                            delay_spread_min=delay_spread_min,   # in nano seconds
+                            delay_spread_max=delay_spread_max,   # in nano seconds
+                            )
 
 
         elif self.channel_type == "AWGN":
