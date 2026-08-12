@@ -538,6 +538,15 @@ class Parameters:
                                 mask_doa = mask_doa,
                                 num_rays = num_rays)
             else: # UMa
+                ignored = [n for n, v in (
+                                ("random_num_clusters", random_num_clusters),
+                                ("random_num_rays", random_num_rays),
+                                ("mask_doa", mask_doa),
+                                ("num_rays", num_rays)) if v]
+                if ignored:
+                    print("Warning: " + ", ".join(ignored) + " are "
+                          "implemented for UMi only and are ignored for "
+                          "channel_type='UMa'.")
                 self.channel_model = UMa(
                                 carrier_frequency=self.carrier_frequency,
                                 o2i_model = 'low',
