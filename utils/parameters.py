@@ -159,7 +159,9 @@ class Parameters:
                 max_ut_velocity_eval=None, min_ut_velocity_eval=None,
                 channel_norm_eval=None, mat_filename_eval=None,
                 channel_type_eval=None, channel_models=None,
-                tdl_models=None, cdl_models=None): # Just a fast solution
+                tdl_models=None, cdl_models=None,
+                num_rx_antennas=None, num_rows_per_panel=None,
+                num_cols_per_panel=None): # Just a fast solution
 
 
 
@@ -184,6 +186,20 @@ class Parameters:
             self.min_ut_velocity_eval = min_ut_velocity_eval
         if channel_norm_eval is not None:
             self.channel_norm_eval = channel_norm_eval
+
+        # BS array override, so that a single config can be evaluated on
+        # several antenna geometries without duplicating it. Set here, before
+        # the antenna arrays are built further down, and before the "dummy"
+        # early return so both passes see the same geometry. None keeps the
+        # config value.
+        if (num_rows_per_panel is None) != (num_cols_per_panel is None):
+            raise ValueError("num_rows_per_panel and num_cols_per_panel must "
+                             "be provided together.")
+        if num_rx_antennas is not None:
+            self.num_rx_antennas = num_rx_antennas
+        if num_rows_per_panel is not None:
+            self.num_rows_per_panel = num_rows_per_panel
+            self.num_cols_per_panel = num_cols_per_panel
 
 
         # Overwrite channel and PRBs in inference mode with "eval" parameters

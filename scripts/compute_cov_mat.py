@@ -28,6 +28,12 @@ parser.add_argument("-gpu", help="GPU to use", type=int, default=0)
 parser.add_argument("-num_tx_eval", help="Number of active users",
                     type=int, default=1)
 parser.add_argument("-n_size_bwp_eval", type=int, default=132)
+# BS array override, mirroring evaluate_metrics.py: the cov matrices are sized
+# by the antenna count, so they have to be built for the same array the
+# equalizer will run on. All three must be given together.
+parser.add_argument("-num_rx_antennas", type=int, default=None)
+parser.add_argument("-num_rows_per_panel", type=int, default=None)
+parser.add_argument("-num_cols_per_panel", type=int, default=None)
 
 # Parse all arguments
 args = parser.parse_args()
@@ -77,7 +83,10 @@ parameters = Parameters(config_name,
                         num_tx_eval=num_tx_eval,
                         system="nrx",
                         compute_cov=True)  # load UMi channel in any case
-parameters.re_init(n_size_bwp_eval=args.n_size_bwp_eval)
+parameters.re_init(n_size_bwp_eval=args.n_size_bwp_eval,
+                   num_rx_antennas=args.num_rx_antennas,
+                   num_rows_per_panel=args.num_rows_per_panel,
+                   num_cols_per_panel=args.num_cols_per_panel)
 
 batch_size = parameters.batch_size_eval
 if hasattr(parameters, "batch_size_cov"):
