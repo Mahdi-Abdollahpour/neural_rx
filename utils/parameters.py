@@ -424,6 +424,48 @@ class Parameters:
                         f'../weights/{self.label}_freq_cov_mat.npy'),
                                             tf.complex64)
         
+    def _build_panel_arrays(self):
+        """Build the BS and UT antenna arrays for the array-based 3GPP models
+        (UMi, UMa, CDL). Returns (bs_array, ut_array)."""
+        if self.num_rx_antennas==1: # ignore polarization for single antenna
+            print("Using vertical polarization for single antenna setup.")
+            num_cols_per_panel = 1
+            num_rows_per_panel = 1
+            polarization = "single"
+            polarization_type = 'V'
+        else:
+
+            if hasattr(self, 'num_cols_per_panel') and hasattr(self, 'num_rows_per_panel'):
+                num_cols_per_panel = self.num_cols_per_panel
+                num_rows_per_panel = self.num_rows_per_panel
+                assert num_cols_per_panel * num_rows_per_panel * 2 == self.num_rx_antennas, \
+    f"Invalid antenna configuration: {num_cols_per_panel} columns * {num_rows_per_panel} rows * 2 " \
+    f"does not equal {self.num_rx_antennas} receive antennas"
+            else:
+                # we use a ULA array to be aligned with TDL models
+                num_cols_per_panel = self.num_rx_antennas//2
+                num_rows_per_panel = 1
+
+            polarization = "dual"
+            polarization_type = 'cross'
+
+
+        bs_array = PanelArray(num_rows_per_panel = num_rows_per_panel,
+                              num_cols_per_panel = num_cols_per_panel,
+                              polarization = polarization,
+                              polarization_type  = polarization_type,
+                              antenna_pattern = '38.901',
+                              carrier_frequency = self.carrier_frequency)
+
+        ut_array = PanelArray(num_rows_per_panel = 1,
+                              num_cols_per_panel = self._pc.num_antenna_ports,
+                              polarization = 'single',
+                              polarization_type = 'V',
+                              antenna_pattern = 'omni',
+                              carrier_frequency = self.carrier_frequency)
+
+        return bs_array, ut_array
+
     def initialize_channel(self,channel_type_eval=None, tdl_models=None, compute_cov=False,
                                 delay_spread_min=10,   # in nano seconds
                                 delay_spread_max=300,  # in nano seconds
@@ -480,42 +522,7 @@ class Parameters:
         # Remark: new channel models can be added here
 
         if self.channel_type in ("UMi", "UMa"):
-            if self.num_rx_antennas==1: # ignore polarization for single antenna
-                print("Using vertical polarization for single antenna setup.")
-                num_cols_per_panel = 1
-                num_rows_per_panel = 1
-                polarization = "single"
-                polarization_type = 'V'
-            else:
-
-                if hasattr(self, 'num_cols_per_panel') and hasattr(self, 'num_rows_per_panel'):
-                    num_cols_per_panel = self.num_cols_per_panel
-                    num_rows_per_panel = self.num_rows_per_panel
-                    assert num_cols_per_panel * num_rows_per_panel * 2 == self.num_rx_antennas, \
-        f"Invalid antenna configuration: {num_cols_per_panel} columns * {num_rows_per_panel} rows * 2 " \
-        f"does not equal {self.num_rx_antennas} receive antennas"
-                else:
-                    # we use a ULA array to be aligned with TDL models
-                    num_cols_per_panel = self.num_rx_antennas//2
-                    num_rows_per_panel = 1
-                    
-                polarization = "dual"
-                polarization_type = 'cross'
-
-
-            bs_array = PanelArray(num_rows_per_panel = num_rows_per_panel,
-                                  num_cols_per_panel = num_cols_per_panel,
-                                  polarization = polarization,
-                                  polarization_type  = polarization_type,
-                                  antenna_pattern = '38.901',
-                                  carrier_frequency = self.carrier_frequency)
-
-            ut_array = PanelArray(num_rows_per_panel = 1,
-                                  num_cols_per_panel = self._pc.num_antenna_ports,
-                                  polarization = 'single',
-                                  polarization_type = 'V',
-                                  antenna_pattern = 'omni',
-                                  carrier_frequency = self.carrier_frequency)
+            bs_array, ut_array = self._build_panel_arrays()
 
             if self.channel_type == "UMi":
                 self.channel_model = UMi(
