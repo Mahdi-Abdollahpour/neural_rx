@@ -12,6 +12,10 @@
 # This allows to train and evaluate different system configurations on the same # server and simplifies logging of the training process.
 import core.runtime as _runtime
 import os
+import sys
+import json
+import hashlib
+from datetime import datetime, timezone
 
 import numpy as np
 import configparser
@@ -38,6 +42,179 @@ def resolve_channel_models(*candidates):
                     if m.upper().startswith(("TDL-", "CDL-")) else m
                     for m in models]
     return None
+
+
+# ---------------------------------------------------------------------------
+# LMMSE covariance matrices: naming, provenance and validation
+# ---------------------------------------------------------------------------
+#
+# The three matrices are sized by the resource grid (fft_size = 12*n_size_bwp,
+# num_ofdm_symbols) and by the BS array. All of those arrive as *runtime*
+# overrides rather than config values, because one .cfg is deliberately
+# evaluated on many geometries. Keying the files on the config label alone
+# therefore let one run silently consume another run's matrices -- and, when
+# compute_cov_mat.py died without anyone noticing, let an evaluation continue
+# on the previous job's matrices. The key below encodes every overridable
+# quantity so the sets no longer collide, and the JSON sidecar records the
+# rest so a mismatch is rejected instead of being interpolated over.
+
+COV_META_SCHEMA_VERSION = 1
+
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+WEIGHTS_DIR = os.path.join(_REPO_ROOT, "weights")
+
+
+def cov_mat_key(params):
+    """Filename stem shared by the covariance triple and its metadata sidecar.
+
+    Both compute_cov_mat.py and Parameters._load_cov_mats() call this, so the
+    writer and the reader cannot drift apart.
+    """
+    rows = getattr(params, "num_rows_per_panel", None)
+    cols = getattr(params, "num_cols_per_panel", None)
+    # "ra<r>x<c>" and "ant<N>" are deliberately different spellings: a (4,4)
+    # dual-pol panel and the (16,1) ULA fallback in _build_panel_arrays() are
+    # both 32 antennas but have different spatial covariance.
+    if rows is not None and cols is not None:
+        geom = f"ra{rows}x{cols}"
+    else:
+        geom = f"ant{params.num_rx_antennas}"
+    return f"{params.label}_prb{params.n_size_bwp}_{geom}_{params.max_num_tx}u"
+
+
+def cov_mat_paths(params):
+    """Absolute paths of the covariance triple and its metadata sidecar."""
+    key = cov_mat_key(params)
+    return {
+        "freq": os.path.join(WEIGHTS_DIR, f"{key}_freq_cov_mat.npy"),
+        "time": os.path.join(WEIGHTS_DIR, f"{key}_time_cov_mat.npy"),
+        "space": os.path.join(WEIGHTS_DIR, f"{key}_space_cov_mat.npy"),
+        "meta": os.path.join(WEIGHTS_DIR, f"{key}_cov_meta.json"),
+    }
+
+
+def cov_mat_expected_shapes(params):
+    """Shapes the interpolator will index, per axis name.
+
+    Read off the resource grid actually in use rather than re-derived from
+    n_size_bwp, so the check is against what LMMSEInterpolator receives.
+    """
+    rg = params.transmitters[0]._resource_grid
+    return {
+        "freq": (int(rg.fft_size), int(rg.fft_size)),
+        "time": (int(rg.num_ofdm_symbols), int(rg.num_ofdm_symbols)),
+        "space": (int(params.num_rx_antennas), int(params.num_rx_antennas)),
+    }
+
+
+def _cov_identity_fields(params):
+    """The run-defining fields compared between sidecar and live Parameters.
+
+    Restricted to quantities that are provably identical on both sides.
+    Deliberately excluded, and recorded in the sidecar for inspection only:
+
+      * ``cov_channel_type`` -- compute_cov_mat.py forces UMi (see the
+        compute_cov branch of re_init below) while the evaluation runs on
+        whatever -channel_type_eval says, so the two never agree by design.
+      * the UT velocity range -- -max_ut_velocity_eval is not forwarded to
+        compute_cov_mat.py, so the cov matrices use the config's value.
+
+    Both are long-standing properties of the LMMSE baseline, not something
+    this check should start failing runs over.
+    """
+    rg = params.transmitters[0]._resource_grid
+    return {
+        "label": params.label,
+        "n_size_bwp": int(params.n_size_bwp),
+        "fft_size": int(rg.fft_size),
+        "num_ofdm_symbols": int(rg.num_ofdm_symbols),
+        "num_rx_antennas": int(params.num_rx_antennas),
+        "num_rows_per_panel": getattr(params, "num_rows_per_panel", None),
+        "num_cols_per_panel": getattr(params, "num_cols_per_panel", None),
+        "max_num_tx": int(params.max_num_tx),
+        "carrier_frequency": float(params.carrier_frequency),
+    }
+
+
+def _config_digest(params):
+    """Hash of the parsed config, so a .cfg edit after generation is visible."""
+    return hashlib.sha256(
+        getattr(params, "config_str", "").encode("utf-8")).hexdigest()[:16]
+
+
+def cov_mat_provenance(params, **extra):
+    """Record written next to the matrices and re-checked when they are read."""
+    shapes = cov_mat_expected_shapes(params)
+    meta = {
+        "schema_version": COV_META_SCHEMA_VERSION,
+        "config_path": getattr(params, "config_path", None),
+        "config_digest": _config_digest(params),
+        # Recorded but not enforced -- see _cov_identity_fields().
+        "cov_channel_type": str(params.channel_type),
+        "min_ut_velocity": float(params.min_ut_velocity),
+        "max_ut_velocity": float(params.max_ut_velocity),
+        "freq_cov_mat_shape": list(shapes["freq"]),
+        "time_cov_mat_shape": list(shapes["time"]),
+        "space_cov_mat_shape": list(shapes["space"]),
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "argv": list(sys.argv),
+    }
+    meta.update(_cov_identity_fields(params))
+    meta.update(extra)
+    return meta
+
+
+def _regenerate_hint(params):
+    """The exact command that produces the matrices this run needs."""
+    cmd = ["python scripts/compute_cov_mat.py",
+           f"-config_name {params.config_name}",
+           f"-n_size_bwp_eval {params.n_size_bwp}",
+           f"-num_tx_eval {params.max_num_tx}"]
+    rows = getattr(params, "num_rows_per_panel", None)
+    cols = getattr(params, "num_cols_per_panel", None)
+    if rows is not None and cols is not None:
+        cmd.append(f"-num_rx_antennas {params.num_rx_antennas}")
+        cmd.append(f"-num_rows_per_panel {rows} -num_cols_per_panel {cols}")
+    return ("Re-run without -skip_cov_compute, or generate them with:\n"
+            "    " + " \\\n        ".join(cmd))
+
+
+# Order in which sionna's LMMSEInterpolator applies its 1D passes. "s" (spatial
+# smoothing across receive antennas) is optional; "f" and "t" are not, since
+# every resource element has to end up with an estimate.
+LMMSE_ORDER_DEFAULT = "s-f-t"
+
+
+def validate_lmmse_order(order):
+    """Check an LMMSEInterpolator ``order`` string and return it unchanged.
+
+    LMMSEInterpolator validates the same thing with bare asserts, but only once
+    the layer is being built -- i.e. after the channel, the transmitters and the
+    covariance matrices have been set up. Checking here turns a typo into an
+    immediate, readable error.
+    """
+    steps = str(order).split("-")
+    unknown = [s for s in steps if s not in ("s", "f", "t")]
+    if unknown:
+        raise ValueError(
+            f"Invalid lmmse_order '{order}': unknown step(s) "
+            f"{', '.join(repr(u) for u in unknown)}. Steps are 's' (space), "
+            f"'f' (frequency) and 't' (time), joined by '-', e.g. 's-f-t'.")
+    repeated = sorted({s for s in steps if steps.count(s) > 1})
+    if repeated:
+        raise ValueError(
+            f"Invalid lmmse_order '{order}': step(s) "
+            f"{', '.join(repr(r) for r in repeated)} given more than once.")
+    missing = [s for s in ("f", "t") if s not in steps]
+    if missing:
+        raise ValueError(
+            f"Invalid lmmse_order '{order}': {' and '.join(missing)} "
+            f"interpolation is mandatory -- without it some resource elements "
+            f"get no channel estimate. Valid orders are permutations of "
+            f"'f-t' with an optional 's', e.g. 's-f-t' or 'f-t'.")
+    return order
 
 
 class Parameters:
@@ -161,9 +338,15 @@ class Parameters:
                 channel_type_eval=None, channel_models=None,
                 tdl_models=None, cdl_models=None,
                 num_rx_antennas=None, num_rows_per_panel=None,
-                num_cols_per_panel=None): # Just a fast solution
+                num_cols_per_panel=None,
+                lmmse_order=None): # Just a fast solution
 
 
+
+        # Drop any memoized covariance matrices: re_init is called a second
+        # time with the CLI overrides, and the geometry it resolves decides
+        # both which files are read and what shape they must have.
+        self._cov_cache = None
 
         if training is None:
             training = self._training
@@ -200,6 +383,16 @@ class Parameters:
         if num_rows_per_panel is not None:
             self.num_rows_per_panel = num_rows_per_panel
             self.num_cols_per_panel = num_cols_per_panel
+
+        # LMMSE interpolation order, used by BaselineReceiver. Configs that do
+        # not set it keep the "s-f-t" that used to be hard-coded there. Resolved
+        # here, next to the array override and before the "dummy" early return,
+        # so both re_init passes agree on it.
+        if lmmse_order is not None:
+            self.lmmse_order = lmmse_order
+        elif not hasattr(self, "lmmse_order"):
+            self.lmmse_order = LMMSE_ORDER_DEFAULT
+        validate_lmmse_order(self.lmmse_order)
 
 
         # Overwrite channel and PRBs in inference mode with "eval" parameters
@@ -440,29 +633,109 @@ class Parameters:
                 if self.pe_type==3: # NRX default + PRB coding
                     self.pe_d = self.pe_d + 2
 
-        ################
-        ##### MISC #####
-        ################
+    # ------------------------------------------------------------------
+    # LMMSE covariance matrices
+    # ------------------------------------------------------------------
+    #
+    # Loaded lazily, on first access, rather than here in re_init. That is
+    # load-bearing, not tidiness: __init__ calls re_init once with the plain
+    # config values and set_eval_params() calls it again with the CLI
+    # overrides, so anything resolved during the first pass sees the config's
+    # geometry (e.g. num_rx_antennas = 4) while the run is on the overridden
+    # one (32). Deferring to first access -- which happens in
+    # BaselineReceiver.__init__, after every override has landed but before
+    # any evaluation runs -- means both the filename and the shape check are
+    # built from the geometry actually in use.
 
-        # Load covariance matrices
-        if self.system in ("baseline_lmmse_kbest", "baseline_lmmse_lmmse"):
+    def _cov_mats(self):
+        """Load, validate and memoize the covariance triple."""
+        if getattr(self, "_cov_cache", None) is None:
+            self._cov_cache = self._load_cov_mats()
+        return self._cov_cache
 
-            # test if files exist
-            fn = f'../weights/{self.label}_time_cov_mat.npy'
-            if not exists(fn):
-                raise FileNotFoundError("time_cov_mat.npy not found. " \
-                    "Please run compute_cov_mat.py for given config first.")
+    @property
+    def freq_cov_mat(self):
+        return self._cov_mats()["freq"]
 
-            self.space_cov_mat = tf.cast(np.load(
-                        f'../weights/{self.label}_space_cov_mat.npy'),
-                                                tf.complex64)
-            self.time_cov_mat = tf.cast(np.load(
-                        f'../weights/{self.label}_time_cov_mat.npy'),
-                                            tf.complex64)
-            self.freq_cov_mat = tf.cast(np.load(
-                        f'../weights/{self.label}_freq_cov_mat.npy'),
-                                            tf.complex64)
-        
+    @property
+    def time_cov_mat(self):
+        return self._cov_mats()["time"]
+
+    @property
+    def space_cov_mat(self):
+        return self._cov_mats()["space"]
+
+    def _load_cov_mats(self):
+        """Read the covariance triple, refusing anything that is not this run's.
+
+        Every failure here is fatal. Silently falling back to whatever is on
+        disk is what let an interrupted compute_cov_mat.py hand a 10-PRB
+        matrix to a 22-PRB evaluation: on the standard interpolator path that
+        surfaced as an opaque IndexError from np.take, and on the
+        low-complexity path (n_size_bwp > 100, see baseline_rx.py) it did not
+        surface at all -- the matrix was simply sliced to size and the run
+        produced a wrong curve.
+        """
+        if self.system not in ("baseline_lmmse_kbest", "baseline_lmmse_lmmse"):
+            raise RuntimeError(
+                f"Covariance matrices are only used by the LMMSE baselines, "
+                f"but system is '{self.system}'.")
+
+        paths = cov_mat_paths(self)
+        expected = cov_mat_expected_shapes(self)
+        want = _cov_identity_fields(self)
+
+        missing = [p for p in paths.values() if not exists(p)]
+        if missing:
+            raise FileNotFoundError(
+                f"No covariance matrices for this run "
+                f"('{cov_mat_key(self)}').\nMissing:\n  "
+                + "\n  ".join(missing) + "\n" + _regenerate_hint(self))
+
+        with open(paths["meta"], encoding="utf-8") as f:
+            meta = json.load(f)
+
+        version = meta.get("schema_version")
+        if version != COV_META_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{paths['meta']} has schema_version {version!r}, expected "
+                f"{COV_META_SCHEMA_VERSION}.\n" + _regenerate_hint(self))
+
+        # The filename already pins PRBs, geometry and users, so a mismatch
+        # here means the sidecar and the matrices were written by different
+        # runs, or the .cfg changed something the key does not encode.
+        diffs = [f"{k}: recorded {meta.get(k)!r}, this run {v!r}"
+                 for k, v in want.items() if meta.get(k) != v]
+
+        arrays = {name: np.load(paths[name])
+                  for name in ("freq", "time", "space")}
+        diffs += [f"{os.path.basename(paths[name])}: found {tuple(arr.shape)}, "
+                  f"expected {expected[name]}"
+                  for name, arr in arrays.items()
+                  if tuple(arr.shape) != expected[name]]
+
+        if diffs:
+            raise RuntimeError(
+                f"Stale covariance matrices for '{self.label}' in "
+                f"{WEIGHTS_DIR}:\n  " + "\n  ".join(diffs)
+                + f"\n  written {meta.get('created_utc')} on channel "
+                  f"{meta.get('cov_channel_type')} by: "
+                  f"{' '.join(meta.get('argv') or ['?'])}\n"
+                + _regenerate_hint(self))
+
+        mats = {name: tf.cast(arr, tf.complex64)
+                for name, arr in arrays.items()}
+
+        # A warning rather than an error: the digest covers the whole .cfg,
+        # including training-only keys that cannot affect these matrices.
+        if meta.get("config_digest") != _config_digest(self):
+            print(f"WARNING: {os.path.basename(self.config_path)} has changed "
+                  f"since {os.path.basename(paths['meta'])} was written. The "
+                  f"shape-relevant fields still match, but the covariance "
+                  f"matrices may be out of date.")
+
+        return mats
+
     def _build_panel_arrays(self):
         """Build the BS and UT antenna arrays for the array-based 3GPP models
         (UMi, UMa, CDL). Returns (bs_array, ut_array)."""

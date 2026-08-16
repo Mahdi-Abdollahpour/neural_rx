@@ -72,7 +72,9 @@ import sionna as sn
 sn.config.xla_compat = True
 from sionna.channel import GenerateOFDMChannel, gen_single_sector_topology
 
-from ext.neural_rx.utils.parameters import Parameters
+from ext.neural_rx.utils.parameters import (
+    Parameters, cov_mat_paths, cov_mat_provenance)
+import json
 import numpy as np
 
 ##################################################################
@@ -185,6 +187,31 @@ time_cov_mat = time_cov_mat.numpy()
 space_cov_mat = space_cov_mat.numpy()
 
 # Save covariance matrices into the main repo weights directory.
-np.save(f"../weights/{parameters.label}_freq_cov_mat", freq_cov_mat)
-np.save(f"../weights/{parameters.label}_time_cov_mat", time_cov_mat)
-np.save(f"../weights/{parameters.label}_space_cov_mat", space_cov_mat)
+#
+# The filenames encode the PRB count, the BS array and the number of users, so
+# that a single config evaluated on several geometries does not overwrite its
+# own matrices -- and so that an evaluation can tell whether what is on disk
+# belongs to it. See cov_mat_key() in utils/parameters.py.
+#
+# Each array is written to a temporary file and moved into place, and the
+# metadata sidecar is written last: a job killed part-way through can then
+# never leave behind a set that looks complete to the loader.
+paths = cov_mat_paths(parameters)
+os.makedirs(os.path.dirname(paths["freq"]), exist_ok=True)
+
+arrays = {"freq": freq_cov_mat, "time": time_cov_mat, "space": space_cov_mat}
+for name, arr in arrays.items():
+    tmp = paths[name] + ".tmp.npy"
+    np.save(tmp, arr)
+    os.replace(tmp, paths[name])
+    print(f"wrote {paths[name]}  {arr.shape}")
+
+meta = cov_mat_provenance(parameters,
+                          num_samples=NUM_SAMPLES,
+                          batch_size=int(batch_size),
+                          num_it=int(NUM_IT))
+tmp = paths["meta"] + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(meta, f, indent=2, sort_keys=True)
+os.replace(tmp, paths["meta"])
+print(f"wrote {paths['meta']}")

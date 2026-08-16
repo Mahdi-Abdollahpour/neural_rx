@@ -132,6 +132,18 @@ class BaselineReceiver(Layer):
                                      'baseline_lmmse_lmmse'):
             # Setup channel estimator for non-perfect CSI
 
+            # Order of the LMMSE interpolation passes. Worth logging: it decides
+            # whether spatial smoothing runs at all, and hence what this
+            # baseline actually is.
+            order = sys_parameters.lmmse_order
+            print(f"Using LMMSE interpolation order '{order}'"
+                  + ("." if "s" in order.split("-")
+                     else " (no spatial smoothing)."))
+            # The spatial covariance is only meaningful -- and only accepted by
+            # LMMSEInterpolator -- when the order contains an "s" step.
+            cov_mat_space = sys_parameters.space_cov_mat \
+                            if "s" in order.split("-") else None
+
             # Use low-complexity LMMSE interpolator for large bandwidth parts
             # to keep computational complexity feasible.
             # Remark: dimensions are hard-coded in config. Needs to be adjusted
@@ -191,14 +203,13 @@ class BaselineReceiver(Layer):
                     offset:(resource_grid.fft_size + offset),
                     offset:(resource_grid.fft_size + offset)
                 ]
-                cov_mat_space = sys_parameters.space_cov_mat
 
                 interpolator = LMMSEInterpolator(
                     pilot_pattern,
                     cov_mat_time=cov_mat_time,
                     cov_mat_freq=cov_mat_freq,
                     cov_mat_space=cov_mat_space,
-                    order="s-f-t"
+                    order=order
                 )
                 # 5G PUSCH version of low-complexity LMMSE
                 self._est = LowComplexityPUSCHLMSEEstimator(
@@ -217,8 +228,8 @@ class BaselineReceiver(Layer):
                     sys_parameters.transmitters[mcs_arr_eval_idx]._resource_grid.pilot_pattern,
                     cov_mat_time=sys_parameters.time_cov_mat,
                     cov_mat_freq=sys_parameters.freq_cov_mat,
-                    cov_mat_space=sys_parameters.space_cov_mat,
-                    order="s-f-t"
+                    cov_mat_space=cov_mat_space,
+                    order=order
                 )
                 pc = sys_parameters.pusch_configs[mcs_arr_eval_idx][0]
                 self._est = PUSCHLSChannelEstimator(

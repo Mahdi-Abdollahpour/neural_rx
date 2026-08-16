@@ -19,6 +19,7 @@
 ####################################################################
 
 import argparse
+import subprocess
 import sys
 sys.path.append('../')
 import core.runtime as _runtime
@@ -66,6 +67,7 @@ parser.add_argument("-tdl_models",help="-tdl_models A B C ...",type=str, nargs='
 parser.add_argument("-n_size_bwp_eval",type=int, default=132)
 parser.add_argument("-batch_size_eval",type=int, default=30)
 parser.add_argument("-batch_size_eval_small",type=int, default=3)
+parser.add_argument("-lmmse_order",help="LMMSE interpolation order for the baseline_lmmse_* receivers: 's' (space), 'f' (frequency), 't' (time) joined by '-'. 'f' and 't' are mandatory, 's' optional, e.g. 's-f-t' or 'f-t'. Default: keep the config value.",type=str, default=None)
 parser.add_argument("-dir",type=str, help="directory to save results.", default="../results/")
 parser.add_argument("-name_suffix",type=str, help="add to results name", default="")
 parser.add_argument("-mcs_index",help="-mcs_index 9 14 19",type=int, nargs='+', default=[-1])
@@ -205,13 +207,16 @@ def set_eval_params(sys_parameters,args):
     else:
         print(f"setting the evaluation channel model to:{args.channel_type_eval} {args.tdl_models}")
     print(f"setting n_size_bwp_eval to {args.n_size_bwp_eval}")
+    if args.lmmse_order is not None:
+        print(f"overriding LMMSE interpolation order: {args.lmmse_order}")
 
     sys_parameters.re_init(n_size_bwp_eval=args.n_size_bwp_eval,
                            batch_size_eval=args.batch_size_eval,
                            batch_size_eval_small=args.batch_size_eval_small,
                            max_ut_velocity_eval=args.max_ut_velocity_eval,
                            channel_type_eval=args.channel_type_eval,tdl_models=args.tdl_models,
-                           mat_filename_eval=args.mat_filename_eval)
+                           mat_filename_eval=args.mat_filename_eval,
+                           lmmse_order=args.lmmse_order)
 
     return sys_parameters
 
@@ -300,8 +305,24 @@ for num_tx_eval in num_tx_evals:
     # Generate covariance matrices for LMMSE-based baselines
     # if not eval_nrx_only:
     if "baseline_lmmse_kbest" in methods or "baseline_lmmse_lmmse" in methods:
-        print("Generating cov matrix.")
-        os.system(f"python compute_cov_mat.py -config_name {config_name} -gpu {gpu} -num_samples {num_cov_samples} -num_tx_eval {num_tx_eval} -n_size_bwp_eval {args.n_size_bwp_eval}")
+        # subprocess.run, not os.system: see scripts/evaluate_metrics.py -- an
+        # ignored exit status leaves the sweep running on a previous job's
+        # covariance matrices.
+        cov_cmd = [
+            sys.executable, "compute_cov_mat.py",
+            "-config_name", str(config_name),
+            "-gpu", str(gpu),
+            "-num_samples", str(num_cov_samples),
+            "-num_tx_eval", str(num_tx_eval),
+            "-n_size_bwp_eval", str(args.n_size_bwp_eval),
+        ]
+        print("Generating cov matrix:", " ".join(cov_cmd))
+        returncode = subprocess.run(cov_cmd).returncode
+        if returncode != 0:
+            raise RuntimeError(
+                f"Covariance generation failed with exit code {returncode}: "
+                f"{' '.join(cov_cmd)}"
+            )
     #-------------------------------------------
 
 
