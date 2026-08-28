@@ -318,6 +318,11 @@ class Parameters:
 
 
        
+        # Fixed training bandwidth, captured before re_init() can collapse
+        # self.n_size_bwp to the eval value. Unlike self.n_size_bwp, this
+        # never changes for the lifetime of this Parameters object.
+        self.n_size_bwp_training = self.n_size_bwp
+
         self._training = training
         self._verbose = verbose
         self._compute_cov = compute_cov
@@ -942,6 +947,25 @@ class Parameters:
                                     max_num_tx = self.max_num_tx,
                                     norm_channel=self.channel_norm,
                                     tdl_models=self.channel_models,
+                                    delay_spread_min=delay_spread_min,   # in nano seconds
+                                    delay_spread_max=delay_spread_max,  # in nano seconds
+                                    doppler_shift_max=doppler_shift_max  # Hz
+                                    )
+
+        # Generic single-letter TDL selection: "TDL-A".."TDL-E" (mirrors the
+        # "CDL-A".."CDL-E" naming below). Routes through NTDLChannel so it
+        # also supports max_num_tx > 1, unlike the fixed single-user
+        # "TDL-B100"/"TDL-C300" presets above.
+        elif self.channel_type.startswith("TDL-"):
+            tdl_models_ = [self.channel_type.split("-", 1)[1]]
+            self.channel = NTDLChannel(carrier_frequency=self.carrier_frequency,
+                                    resource_grid=self.transmitters[0].resource_grid,
+                                    correlation="low",
+                                    num_tx_ant=self._pc.num_antenna_ports,
+                                    num_rx_ant = self.num_rx_antennas,
+                                    max_num_tx = self.max_num_tx,
+                                    norm_channel=self.channel_norm,
+                                    tdl_models=tdl_models_,
                                     delay_spread_min=delay_spread_min,   # in nano seconds
                                     delay_spread_max=delay_spread_max,  # in nano seconds
                                     doppler_shift_max=doppler_shift_max  # Hz
