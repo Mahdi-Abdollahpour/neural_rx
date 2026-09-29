@@ -367,13 +367,210 @@ def grads_to_dict(
 
 
 
+# ---------------------------------------------------------------------------
+# Multi-channel evaluation during training (config key: eval_channel_type_arr)
+#
+# The periodic eval in training_loop can be run against channel models other
+# than the one being trained on. Parameters.initialize_channel() rebuilds
+# sys_parameters.channel in place, so an "eval channel" is just a snapshot of
+# the three attributes that must always travel together.
+# ---------------------------------------------------------------------------
+
+# sys_parameters.channel_model is assigned *only* by the UMi/UMa/UMiTDS and
+# OFDMDataset branches of initialize_channel(); for TDL/CDL/AWGN/Dataset the
+# attribute may not exist at all. Restoring must therefore be able to remove it
+# again, otherwise a stale channel_model could be paired with a channel_type
+# that makes E2E_Model.call feed it to set_topology().
+_CHANNEL_ATTR_MISSING = object()
+
+
+def _snapshot_channel(sys_parameters):
+    """Capture the channel state of ``sys_parameters`` as one atomic unit."""
+    return (sys_parameters.channel_type,
+            sys_parameters.channel,
+            getattr(sys_parameters, "channel_model", _CHANNEL_ATTR_MISSING))
+
+
+def _set_untracked(model, name, value):
+    """setattr on a Keras model without registering a trackable dependency.
+
+    E2E_Model is a keras Model and save_weights(..., 'pkl') stores a flat,
+    index-ordered get_weights() list. If an eval channel layer ever held a
+    variable, plain attribute assignment would append it to model.weights and
+    silently shift every checkpoint index.
+    """
+    prev = getattr(model, "_self_setattr_tracking", True)
+    model._self_setattr_tracking = False
+    try:
+        setattr(model, name, value)
+    finally:
+        model._self_setattr_tracking = prev
+
+
+def _restore_channel(sys_parameters, model, snap):
+    """Bind ``snap`` onto sys_parameters *and* model.
+
+    The only place model._channel may be rebound after construction:
+    E2E_Model.__init__ copies sys_parameters.channel once, while E2E_Model.call
+    reads sys_parameters.channel_type / .channel_model live.
+    """
+    channel_type, channel, channel_model = snap
+    sys_parameters.channel_type = channel_type
+    sys_parameters.channel = channel
+    if channel_model is _CHANNEL_ATTR_MISSING:
+        if hasattr(sys_parameters, "channel_model"):
+            del sys_parameters.channel_model
+    else:
+        sys_parameters.channel_model = channel_model
+    _set_untracked(model, "_channel", channel)
+
+
+class _EvalChannelBinding:
+    """One evaluation channel: its snapshot and its own traced eval function."""
+
+    __slots__ = ("requested", "label", "snapshot", "eval_fn")
+
+    def __init__(self, requested, label, snapshot, eval_fn):
+        self.requested = requested
+        self.label = label
+        self.snapshot = snapshot
+        self.eval_fn = eval_fn
+
+
+def _normalize_eval_channel_types(eval_channel_type_arr):
+    """Validate the config value. Returns a list of str, or None if unset."""
+    if eval_channel_type_arr is None:
+        return None
+    if isinstance(eval_channel_type_arr, str):
+        raise ValueError(
+            "eval_channel_type_arr must be a list of channel-type strings, "
+            f"not a bare string. Did you mean ['{eval_channel_type_arr}']?")
+    if not isinstance(eval_channel_type_arr, (list, tuple)):
+        raise ValueError(
+            "eval_channel_type_arr must be a list or tuple of channel-type "
+            f"strings, got {type(eval_channel_type_arr).__name__}.")
+    types = list(eval_channel_type_arr)
+    if not types:
+        return None
+    bad = [t for t in types if not isinstance(t, str)]
+    if bad:
+        raise ValueError(
+            f"eval_channel_type_arr entries must be strings, got {bad!r}.")
+    return types
+
+
+def _eval_channel_unavailable(sys_parameters, channel_type):
+    """Return a reason string if ``channel_type`` cannot be built here, else None.
+
+    Only cases that initialize_channel() would turn into a confusing traceback
+    are pre-screened. Genuine build errors are caught by the caller.
+    Note CDL-<X>/TDL-<X> are *not* restricted to one user: NCDLChannel and
+    NTDLChannel tile a short profile list up to max_num_tx.
+    """
+    max_num_tx = sys_parameters.max_num_tx
+    if channel_type in ("TDL-B100", "TDL-C300"):
+        if max_num_tx != 1:
+            return f"requires exactly 1 UE, but max_num_tx={max_num_tx}"
+    elif channel_type == "Dataset":
+        name = getattr(sys_parameters, "tfrecord_filename", "")
+        if not name or name == "na":
+            return ("needs [training] tfrecord_filename to point at a dataset "
+                    f"(got {name!r})")
+    elif channel_type == "OFDMDataset":
+        name = getattr(sys_parameters, "mat_filename", "")
+        if not name or name == "na":
+            return ("needs [training] mat_filename to point at a dataset "
+                    f"(got {name!r})")
+    return None
+
+
+def _build_eval_channel_bindings(sys_parameters, model, requested_types,
+                                 make_eval_fn):
+    """Build one channel + one traced eval function per requested channel type.
+
+    The training channel is snapshotted first and restored after *every*
+    iteration, so a partial build (initialize_channel assigns channel_type
+    before it can raise) can never leave the training channel inconsistent.
+
+    Returns ``(training_snapshot, bindings)``.
+    """
+    training_snap = _snapshot_channel(sys_parameters)
+    bindings = []
+    seen = {}
+
+    for requested in requested_types:
+        reason = _eval_channel_unavailable(sys_parameters, requested)
+        if reason is not None:
+            print(f"[eval channels] skipping '{requested}': {reason}.",
+                  flush=True)
+            continue
+
+        binding = None
+        try:
+            # Only channel_type_eval: passing channel_models would permanently
+            # overwrite sys_parameters.channel_models/tdl_models/cdl_models,
+            # and compute_cov=True would rewrite every type to UMi.
+            sys_parameters.initialize_channel(channel_type_eval=requested)
+            binding = _EvalChannelBinding(
+                requested=requested,
+                # Read the *effective* type back: initialize_channel silently
+                # rewrites DoubleTDL* -> TDL-B100 when max_num_tx == 1.
+                label=sys_parameters.channel_type,
+                snapshot=_snapshot_channel(sys_parameters),
+                eval_fn=make_eval_fn())
+        except Exception as err:  # pylint: disable=broad-except
+            print(f"[eval channels] skipping '{requested}': could not build "
+                  f"channel ({type(err).__name__}: {err}).", flush=True)
+            continue
+        finally:
+            _restore_channel(sys_parameters, model, training_snap)
+
+        if binding.label in seen:
+            print(f"[eval channels] skipping '{requested}': resolves to "
+                  f"'{binding.label}', already provided by "
+                  f"'{seen[binding.label]}'.", flush=True)
+            continue
+        seen[binding.label] = requested
+        bindings.append(binding)
+
+    return training_snap, bindings
+
+
+def _warm_up_eval_channels(sys_parameters, model, bindings, training_snap,
+                           batch_size, eval_snr_db, max_num_tx, mcs_arr_idx):
+    """Trace every eval channel up front, dropping the ones that fail.
+
+    Shape-incompatible channels (AWGN against a multi-antenna RX, for example)
+    only fail at trace time, so without this they would take the run down 1k
+    iterations in, inside the summary writer. This also front-loads all XLA
+    compilation, which makes the trace count observable at startup.
+    """
+    kept = []
+    try:
+        for binding in bindings:
+            print(f"[eval channels] warming up '{binding.label}' "
+                  f"(this compiles one XLA executable)...", flush=True)
+            try:
+                _restore_channel(sys_parameters, model, binding.snapshot)
+                binding.eval_fn(batch_size, eval_snr_db, max_num_tx,
+                                mcs_arr_idx)
+            except Exception as err:  # pylint: disable=broad-except
+                print(f"[eval channels] dropping '{binding.label}': eval failed "
+                      f"({type(err).__name__}: {err}).", flush=True)
+                continue
+            kept.append(binding)
+    finally:
+        _restore_channel(sys_parameters, model, training_snap)
+    return kept
+
+
 def training_loop(model, label, filename, training_logdir, training_seed,
                   training_schedule, eval_ebno_db_arr, min_num_tx, max_num_tx,
                   sys_parameters, mcs_arr_training_idx,
                   mcs_training_snr_db_offset=None, mcs_training_probs=None,
                   weight_saving_schedule=None, transfer_loaded=False, xla=False, save_format='pkl',
                   grad_log_include_name='detect',
-                  log_grads=False):
+                  log_grads=False, eval_channel_type_arr=None):
     # pylint: disable=line-too-long
     r"""
     Training loop used to train a system ``model``.
@@ -410,6 +607,21 @@ def training_loop(model, label, filename, training_logdir, training_seed,
     eval_ebno_db_arr : list
         EbNo points in dB the model loss is evaluated during training every 1k
         iterations.
+
+    eval_channel_type_arr : list of str or None
+        Channel types the model is additionally evaluated on during training,
+        e.g. ``['UMi', 'CDL-B', 'TDL-A', 'DoubleTDLlow']``. Each periodic eval
+        then logs channels x MCS x EbNo scalars, tagged with ``ch=<type>``.
+        The list is the complete set: the training channel is only evaluated if
+        it is listed. Entries that cannot be built for this setup are skipped
+        with a warning.
+        Defaults to None, which falls back to
+        ``sys_parameters.eval_channel_type_arr`` and, if that is absent too,
+        reproduces the legacy single-channel behaviour exactly.
+        Remark: these channels are built from the *training* Parameters, so
+        they use max_ut_velocity / min_ut_velocity / channel_norm and the
+        training resource grid, not the ``*_eval`` values that evaluate.py
+        applies via re_init(). Only the channel model differs between curves.
 
     min_num_tx : int
         Minimum number of transmitters.
@@ -453,6 +665,18 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
     # Enable XLA compatibility when xla==True
     sn.config.xla_compat = xla
+
+    # Optional multi-channel evaluation. Follows the house convention for
+    # optional config keys (cf. mcs_training_snr_db_offset in
+    # scripts/train_neural_rx.py), so no call site needs to change.
+    if eval_channel_type_arr is None:
+        eval_channel_type_arr = getattr(sys_parameters,
+                                        "eval_channel_type_arr", None)
+    eval_channel_type_arr = _normalize_eval_channel_types(eval_channel_type_arr)
+    # Only tensorize the eval SNR when the feature is in use: it removes one
+    # trace per SNR point, but it also stops XLA constant-folding ebnodb2no,
+    # which would perturb the RNG stream of existing runs.
+    snr_as_tensor = eval_channel_type_arr is not None
 
     if mcs_training_snr_db_offset is not None:
         mcs_training_snr_db_offset = tf.constant(mcs_training_snr_db_offset,
@@ -738,8 +962,7 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
     # XLA compilation function for evaluation of model performance
     # Set different mcs_arr_idx as integer to trigger XLA re-tracing.
-    @tf.function(jit_compile=xla)
-    def eval_model_xla(batch_size, eval_snr_db, max_num_tx, mcs_arr_idx):
+    def _eval_body(batch_size, eval_snr_db, max_num_tx, mcs_arr_idx):
 
         # if sys_parameters.system=='mdx':
         #     bce_rel = [tf.constant(0.0, dtype=tf.float32) for _ in range(sys_parameters.num_nrx_iter+1)]
@@ -760,6 +983,68 @@ def training_loop(model, label, filename, training_logdir, training_seed,
                         mcs_arr_eval_idx=mcs_arr_idx)
             return loss_dict
 
+    def _make_eval_fn():
+        """A *fresh* tf.function per eval channel.
+
+        The channel is read from captured state (model._channel,
+        sys_parameters.channel_type/.channel_model), so the graph is bound to
+        whichever channel was active when it was traced. tf.function caches on
+        input signature, never on captured objects, so one shared function
+        would silently replay the first channel's graph for every channel.
+        Keeping a distinct function object per channel makes that binding
+        structural -- do not "optimize" this into a single tf.function keyed on
+        a channel index, and do not add reduce_retracing/input_signature here.
+        """
+        return tf.function(jit_compile=xla)(_eval_body)
+
+    # Legacy / no-eval-channels path: byte-identical to the previous decorator.
+    eval_model_xla = _make_eval_fn()
+
+    training_channel_snap = None
+    eval_bindings = []
+    if eval_channel_type_arr is not None:
+        print(f"[eval channels] requested: {eval_channel_type_arr}", flush=True)
+        training_channel_snap, eval_bindings = _build_eval_channel_bindings(
+                sys_parameters, model, eval_channel_type_arr, _make_eval_fn)
+
+        # Warm-up uses exactly the argument values the eval loop will use, so
+        # the traces it creates are the ones that get reused (batch_size and
+        # mcs_arr_idx are Python ints and therefore part of the cache key).
+        _wu_mcs_arr_idx = mcs_arr_training_idx[0]
+        _wu_batch_size = training_schedule["batch_size"][0]
+        _wu_ebno = eval_ebno_db_arr[_wu_mcs_arr_idx]
+        if isinstance(_wu_ebno, (list, tuple)):
+            _wu_ebno = _wu_ebno[0]
+        if not sys_parameters.ebno:
+            _wu_no = ebnodb2no(
+                _wu_ebno,
+                model._transmitters[_wu_mcs_arr_idx]._num_bits_per_symbol,
+                model._transmitters[_wu_mcs_arr_idx]._target_coderate,
+                model._transmitters[_wu_mcs_arr_idx]._resource_grid)
+            _wu_snr_db = - 10.0 * tf.math.log(_wu_no) / tf.math.log(10.0)
+        else:
+            _wu_snr_db = tf.constant(float(_wu_ebno), tf.float32)
+
+        eval_bindings = _warm_up_eval_channels(
+                sys_parameters, model, eval_bindings, training_channel_snap,
+                _wu_batch_size, _wu_snr_db, max_num_tx, _wu_mcs_arr_idx)
+
+        if eval_bindings:
+            print("[eval channels] active: "
+                  + ", ".join(f"{b.requested}->{b.label}" for b in eval_bindings),
+                  flush=True)
+        else:
+            print("Warning: eval_channel_type_arr was set but no channel could "
+                  "be built; falling back to the training channel only.",
+                  flush=True)
+
+    # One entry per logged channel. The legacy path is a single entry with no
+    # binding: nothing is ever swapped and every tag string is unchanged.
+    if eval_bindings:
+        eval_plan = [(b, f" ch={b.label}") for b in eval_bindings]
+    else:
+        eval_plan = [(None, "")]
+
     ## Logs loss and learning rate
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     logdir = os.path.join(training_logdir, f"{label}-{current_time}")
@@ -770,6 +1055,11 @@ def training_loop(model, label, filename, training_logdir, training_seed,
         tf.summary.text("config",
                         sys_parameters.config_str,
                         step=0)
+        if eval_bindings:
+            tf.summary.text("eval_channels",
+                            " | ".join(f"{b.requested}->{b.label}"
+                                       for b in eval_bindings),
+                            step=0)
         ## Training loop
         global_iter = tf.zeros((), tf.int64)
         for i, num_iterations in enumerate(training_schedule["num_iter"]):
@@ -842,70 +1132,88 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
 
                 # Log progress and model performance
-                for mcs_i, mcs_arr_idx in enumerate(mcs_arr_training_idx):
-                    eval_ebno_mcsi = eval_ebno_db_arr[mcs_arr_idx]
-                    multi_snr = isinstance(eval_ebno_mcsi, (list, tuple))
-                    eval_ebno_list = eval_ebno_mcsi if multi_snr else [eval_ebno_mcsi]
-
-                    for eval_ebno_val in eval_ebno_list:
-                        snr_suffix = f" snr={float(eval_ebno_val):.1f}dB" if multi_snr else ""
-                        # compute ebno_db for current MCS
-                        if not sys_parameters.ebno:
-                            # convert EbNo to SNR
-                            eval_no = ebnodb2no(
-                                eval_ebno_val,
-                                model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
-                                model._transmitters[mcs_arr_idx]._target_coderate,
-                                model._transmitters[mcs_arr_idx]._resource_grid)
-                            eval_snr_db = - 10.0 * tf.math.log(eval_no) / tf.math.log(10.0)
+                try:
+                    for _binding, chan_suffix in eval_plan:
+                        if _binding is not None:
+                            _restore_channel(sys_parameters, model,
+                                             _binding.snapshot)
+                            eval_fn = _binding.eval_fn
                         else:
-                            # model takes in EbNo (not SNR)
-                            eval_snr_db = eval_ebno_val
-                        # if sys_parameters.system=='mdx':
-                        #     loss_data_mcs, loss_chestv, bce_rel, loss_chest_allv = eval_model_xla(batch_size, _snr_db,
-                        #                                 max_num_tx, mcs_arr_idx)
-                        #     tf.summary.scalar(
-                        #                 f"Eval CE loss / mcs_arr_idx=" + str(mcs_arr_idx),
-                        #                 loss_data_mcs, step=global_iter)
-                        #     tf.summary.scalar(
-                        #                 f"Eval CHEst loss/ mcs_arr_idx=" + str(mcs_arr_idx),
-                        #                 loss_chestv, step=global_iter)
-                        #     if isinstance(bce_rel, list):
-                        #         for i, value in enumerate(bce_rel):
-                        #             tf.summary.scalar(f"Eval BCE rel. PerfCh {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
-                        #         for i, value in enumerate(loss_chest_allv):
-                        #             tf.summary.scalar(f"Eval CHEst {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+                            eval_fn = eval_model_xla
+                        for mcs_i, mcs_arr_idx in enumerate(mcs_arr_training_idx):
+                            eval_ebno_mcsi = eval_ebno_db_arr[mcs_arr_idx]
+                            multi_snr = isinstance(eval_ebno_mcsi, (list, tuple))
+                            eval_ebno_list = eval_ebno_mcsi if multi_snr else [eval_ebno_mcsi]
 
-                        if sys_parameters.system=='nrx':
-                            loss_data_mcs, loss_chestv = eval_model_xla(batch_size, eval_snr_db,
-                                                        max_num_tx, mcs_arr_idx)
-                            tf.summary.scalar(
-                                        f"Eval CE loss / mcs_arr_idx={mcs_arr_idx}{snr_suffix}",
-                                        loss_data_mcs, step=global_iter)
-                            tf.summary.scalar(
-                                        f"Eval CHEst loss/ mcs_arr_idx={mcs_arr_idx}{snr_suffix}",
-                                        loss_chestv, step=global_iter)
-
-
-
-                        if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
-                            loss_dict_mcs = eval_model_xla(batch_size, eval_snr_db,
-                                                        max_num_tx, mcs_arr_idx)
-
-                            for name, value in loss_dict_mcs.items():
-                                if isinstance(value, dict):
-                                    # handle nested dicts (e.g. EchoLoss)
-                                    # log only first mcs for echoloss eval
-                                    # if mcs_i==0:
-                                    for sub_name, sub_value in value.items():
-                                        sub_value = tf.convert_to_tensor(sub_value)
-                                        sub_value = tf.reshape(sub_value, [])
-                                        tf.summary.scalar(f"{name}/{sub_name}/Eval:{mcs_arr_idx}{snr_suffix}", sub_value, step=global_iter)
+                            for eval_ebno_val in eval_ebno_list:
+                                snr_suffix = f" snr={float(eval_ebno_val):.1f}dB" if multi_snr else ""
+                                # compute ebno_db for current MCS
+                                if not sys_parameters.ebno:
+                                    # convert EbNo to SNR
+                                    eval_no = ebnodb2no(
+                                        eval_ebno_val,
+                                        model._transmitters[mcs_arr_idx]._num_bits_per_symbol,
+                                        model._transmitters[mcs_arr_idx]._target_coderate,
+                                        model._transmitters[mcs_arr_idx]._resource_grid)
+                                    eval_snr_db = - 10.0 * tf.math.log(eval_no) / tf.math.log(10.0)
                                 else:
-                                    # handle scalar values
-                                    value = tf.convert_to_tensor(value)
-                                    value = tf.reshape(value, [])
-                                    tf.summary.scalar(f"{name}/ Eval mcs:{mcs_arr_idx}{snr_suffix}", value, step=global_iter)
+                                    # model takes in EbNo (not SNR)
+                                    eval_snr_db = (
+                                        tf.constant(float(eval_ebno_val), tf.float32)
+                                        if snr_as_tensor else eval_ebno_val)
+                                # if sys_parameters.system=='mdx':
+                                #     loss_data_mcs, loss_chestv, bce_rel, loss_chest_allv = eval_model_xla(batch_size, _snr_db,
+                                #                                 max_num_tx, mcs_arr_idx)
+                                #     tf.summary.scalar(
+                                #                 f"Eval CE loss / mcs_arr_idx=" + str(mcs_arr_idx),
+                                #                 loss_data_mcs, step=global_iter)
+                                #     tf.summary.scalar(
+                                #                 f"Eval CHEst loss/ mcs_arr_idx=" + str(mcs_arr_idx),
+                                #                 loss_chestv, step=global_iter)
+                                #     if isinstance(bce_rel, list):
+                                #         for i, value in enumerate(bce_rel):
+                                #             tf.summary.scalar(f"Eval BCE rel. PerfCh {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+                                #         for i, value in enumerate(loss_chest_allv):
+                                #             tf.summary.scalar(f"Eval CHEst {i} mcs:" + str(mcs_arr_idx), value, step=global_iter)
+
+                                if sys_parameters.system=='nrx':
+                                    loss_data_mcs, loss_chestv = eval_fn(batch_size, eval_snr_db,
+                                                                max_num_tx, mcs_arr_idx)
+                                    tf.summary.scalar(
+                                                f"Eval CE loss / mcs_arr_idx={mcs_arr_idx}{snr_suffix}{chan_suffix}",
+                                                loss_data_mcs, step=global_iter)
+                                    tf.summary.scalar(
+                                                f"Eval CHEst loss/ mcs_arr_idx={mcs_arr_idx}{snr_suffix}{chan_suffix}",
+                                                loss_chestv, step=global_iter)
+
+
+
+                                if sys_parameters.system=='deep_echo' or sys_parameters.system=='mdx':
+                                    loss_dict_mcs = eval_fn(batch_size, eval_snr_db,
+                                                                max_num_tx, mcs_arr_idx)
+
+                                    for name, value in loss_dict_mcs.items():
+                                        if isinstance(value, dict):
+                                            # handle nested dicts (e.g. EchoLoss)
+                                            # log only first mcs for echoloss eval
+                                            # if mcs_i==0:
+                                            for sub_name, sub_value in value.items():
+                                                sub_value = tf.convert_to_tensor(sub_value)
+                                                sub_value = tf.reshape(sub_value, [])
+                                                tf.summary.scalar(f"{name}/{sub_name}/Eval:{mcs_arr_idx}{snr_suffix}{chan_suffix}", sub_value, step=global_iter)
+                                        else:
+                                            # handle scalar values
+                                            value = tf.convert_to_tensor(value)
+                                            value = tf.reshape(value, [])
+                                            tf.summary.scalar(f"{name}/ Eval mcs:{mcs_arr_idx}{snr_suffix}{chan_suffix}", value, step=global_iter)
+
+                finally:
+                    # Never leave an eval channel bound to the model: the
+                    # training graph would keep running against the training
+                    # channel while sys_parameters described a different one.
+                    if eval_bindings:
+                        _restore_channel(sys_parameters, model,
+                                         training_channel_snap)
 
                 if sys_parameters.system=='nrx':
                     tf.summary.scalar(f"Loss", loss_data, step=global_iter)
