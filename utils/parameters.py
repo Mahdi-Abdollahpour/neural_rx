@@ -22,7 +22,7 @@ import configparser
 import tensorflow as tf
 from os.path import exists
 from sionna.nr import PUSCHConfig, PUSCHDMRSConfig, TBConfig, CarrierConfig, PUSCHTransmitter, PUSCHPilotPattern
-from sionna.channel.tr38901 import PanelArray, UMi, TDL, UMa
+from sionna.channel.tr38901 import PanelArray, UMi, UMiTDS, TDL, UMa
 from sionna.mimo import StreamManagement
 from sionna.channel import OFDMChannel, AWGN
 from .channel_models import DoubleTDLChannel, DatasetChannel, NTDLChannel, NCDLChannel, OFDMDatasetChannel, OFDMDatasetChannelSampler
@@ -817,6 +817,13 @@ class Parameters:
         else:
             num_rays = None       
 
+        # UMiTDS augmentation knobs (see docs/umiar_channel_proposal_solution.md)
+        umitds_kwargs = {k: getattr(self, k) for k in (
+            "tilt_aug", "tilt_prob", "tilt_range_deg",
+            "ds_aug", "ds_prob", "ds_shift_range", "lsp_shift",
+            "rx_scramble", "rx_scramble_prob", "lam_range",
+            "fix_ray_offsets", "aug_seed") if hasattr(self, k)}
+
 
         if channel_type_eval is not None:
             self.channel_type = channel_type_eval
@@ -830,7 +837,7 @@ class Parameters:
         # always use UMi to calculate covariance matrix
         if compute_cov:
             # if not self.channel_type in ("UMi", "UMa", "OFDMDataset"): # use UMa if selected, use dataset if selected
-            if not self.channel_type in ("UMi", "UMa"): # use UMa if selected, use dataset if selected
+            if not self.channel_type in ("UMi", "UMa", "UMiTDS"): # use UMa if selected, use dataset if selected
                 print("Setting channel type to UMi for covariance computation.")
                 self.channel_type = "UMi"
 
@@ -844,11 +851,13 @@ class Parameters:
         # Initialize channel
         # Remark: new channel models can be added here
 
-        if self.channel_type in ("UMi", "UMa"):
+        if self.channel_type in ("UMi", "UMa", "UMiTDS"):
             bs_array, ut_array = self._build_panel_arrays()
 
-            if self.channel_type == "UMi":
-                self.channel_model = UMi(
+            if self.channel_type in ("UMi", "UMiTDS"):
+                cls_ = UMi if self.channel_type == "UMi" else UMiTDS
+                extra = {} if self.channel_type == "UMi" else umitds_kwargs
+                self.channel_model = cls_(
                                 carrier_frequency=self.carrier_frequency,
                                 o2i_model = 'low',
                                 bs_array = bs_array,
@@ -859,7 +868,8 @@ class Parameters:
                                 random_num_clusters = random_num_clusters,
                                 random_num_rays = random_num_rays,
                                 mask_doa = mask_doa,
-                                num_rays = num_rays)
+                                num_rays = num_rays,
+                                **extra)
             else: # UMa
                 ignored = [n for n, v in (
                                 ("random_num_clusters", random_num_clusters),

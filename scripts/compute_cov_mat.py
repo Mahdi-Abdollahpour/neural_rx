@@ -118,7 +118,7 @@ else:
 
 def sample_channel(batch_size):
     # Sample a random network topology for each batch example
-    if parameters.channel_type in ("UMi", "UMa"):
+    if parameters.channel_type in ("UMi", "UMa", "UMiTDS"):
         topology = gen_single_sector_topology(
             batch_size,
             1,

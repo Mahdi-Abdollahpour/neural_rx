@@ -341,11 +341,11 @@ class DataGeneratorAerial(Model):
             no = 10**(-ebno_db/10)
 
         # Update topology only required for 3GPP Umi model
-        if self._sys_parameters.channel_type in ("UMi", "UMa"):
-            if self._sys_parameters.channel_type == "UMi":
-                ch_type = 'umi'
-            else:
+        if self._sys_parameters.channel_type in ("UMi", "UMa", "UMiTDS"):
+            if self._sys_parameters.channel_type == "UMa":
                 ch_type = 'uma'
+            else:
+                ch_type = 'umi'
             # Topology update only required for 3GPP pilot patterns
             topology = gen_single_sector_topology(
                         batch_size,
