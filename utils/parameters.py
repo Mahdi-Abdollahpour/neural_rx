@@ -26,6 +26,7 @@ from sionna.channel.tr38901 import PanelArray, UMi, UMiTDS, TDL, UMa
 from sionna.mimo import StreamManagement
 from sionna.channel import OFDMChannel, AWGN
 from .channel_models import DoubleTDLChannel, DatasetChannel, NTDLChannel, NCDLChannel, OFDMDatasetChannel, OFDMDatasetChannelSampler
+from .multi_channels import MultiTDLChannel, MultiCDLChannel
 from .impairments import FrequencyOffset
 
 def resolve_channel_models(*candidates):
@@ -316,6 +317,13 @@ class Parameters:
                 if verbose:
                     print(s)
 
+        # Optional cfg list of channel profile letters, kept apart because
+        # re_init() rebuilds self.channel_models on every call.
+        self._cfg_channel_profiles = resolve_channel_models(
+            getattr(self, "channel_models", None),
+            getattr(self, "cdl_models", None),
+            getattr(self, "tdl_models", None))
+
 
        
         # Fixed training bandwidth, captured before re_init() can collapse
@@ -571,15 +579,18 @@ class Parameters:
         # ##############################
         # ##### Initialize Channel #####
         # ##############################
-        self.channel_models = ["A"]
         self._pc = pc
 
         # One list of profile letters serves both the TDL and the CDL family;
-        # -tdl_models / -cdl_models are kept as aliases of -channel_models.
+        # -tdl_models / -cdl_models are kept as aliases of -channel_models,
+        # and a cfg list is the fallback. channel_profiles stays None when no
+        # list is given: the per-sample 'TDL'/'CDL' models then draw from all
+        # of A..E, while 'NTDLlow'/'NCDL' keep their ['A'] default.
         channel_models = resolve_channel_models(channel_models, cdl_models,
                                                 tdl_models)
-        if channel_models is not None:
-            self.channel_models = channel_models
+        self.channel_profiles = (channel_models or
+                                 getattr(self, "_cfg_channel_profiles", None))
+        self.channel_models = self.channel_profiles or ["A"]
         # Legacy attribute names
         self.tdl_models = self.channel_models
         self.cdl_models = self.channel_models
@@ -830,6 +841,7 @@ class Parameters:
         channel_models = resolve_channel_models(channel_models, cdl_models,
                                                 tdl_models)
         if channel_models is not None:
+            self.channel_profiles = channel_models
             self.channel_models = channel_models
             # Legacy attribute names
             self.tdl_models = self.channel_models
@@ -962,6 +974,23 @@ class Parameters:
                                     doppler_shift_max=doppler_shift_max  # Hz
                                     )
 
+        # Per-sample TDL: every (sample, user) draws its profile uniformly
+        # from channel_profiles (all of A..E if none was given), its delay
+        # spread and its UT speed (min/max_ut_velocity).
+        elif self.channel_type == "TDL":
+            self.channel = MultiTDLChannel(
+                            carrier_frequency=self.carrier_frequency,
+                            resource_grid=self.transmitters[0].resource_grid,    # resource grid is independent of MCS
+                            num_rx_ant=self.num_rx_antennas,
+                            num_tx_ant=self._pc.num_antenna_ports,
+                            models=self.channel_profiles,
+                            min_speed=self.min_ut_velocity,
+                            max_speed=self.max_ut_velocity,
+                            delay_spread_min=delay_spread_min,   # in nano seconds
+                            delay_spread_max=delay_spread_max,   # in nano seconds
+                            correlation="low",
+                            norm_channel=self.channel_norm)
+
         # Generic single-letter TDL selection: "TDL-A".."TDL-E" (mirrors the
         # "CDL-A".."CDL-E" naming below). Routes through NTDLChannel so it
         # also supports max_num_tx > 1, unlike the fixed single-user
@@ -982,10 +1011,27 @@ class Parameters:
                                     )
 
 
-        # CDL for evaluation. "CDL-A" .. "CDL-E" select a single profile
-        # (matching the "TDL-B100"/"TDL-C300" naming), plain "CDL" draws the
-        # per-user profiles from self.channel_models.
-        elif self.channel_type == "CDL" or self.channel_type.startswith("CDL-"):
+        # Per-sample CDL: every (sample, user) draws its profile uniformly
+        # from channel_profiles (all of A..E if none was given), its delay
+        # spread and its UT velocity (min/max_ut_velocity).
+        elif self.channel_type == "CDL":
+            bs_array, ut_array = self._build_panel_arrays()
+            self.channel = MultiCDLChannel(
+                            carrier_frequency=self.carrier_frequency,
+                            resource_grid=self.transmitters[0].resource_grid,    # resource grid is independent of MCS
+                            bs_array=bs_array,
+                            ut_array=ut_array,
+                            models=self.channel_profiles,
+                            min_speed=self.min_ut_velocity,
+                            max_speed=self.max_ut_velocity,
+                            delay_spread_min=delay_spread_min,   # in nano seconds
+                            delay_spread_max=delay_spread_max,   # in nano seconds
+                            norm_channel=self.channel_norm)
+
+        # CDL with one profile per user per batch (NCDLChannel). "CDL-A" ..
+        # "CDL-E" select a single profile (matching the "TDL-B100"/"TDL-C300"
+        # naming), "NCDL" takes the per-user profiles from self.channel_models.
+        elif self.channel_type == "NCDL" or self.channel_type.startswith("CDL-"):
             if self.channel_type.startswith("CDL-"):
                 cdl_models_ = [self.channel_type.split("-", 1)[1]]
             else:
@@ -1052,4 +1098,8 @@ class Parameters:
 
 
         else:
-            raise ValueError(f"{self.name} Unknown Channel type \'{self.channel_type}\'!")
+            raise ValueError(
+                f"Unknown channel type '{self.channel_type}'. Expected one of "
+                "UMi, UMa, UMiTDS, TDL, CDL, NTDLlow, NCDL, TDL-<A..E>, "
+                "CDL-<A..E>, TDL-B100, TDL-C300, DoubleTDLlow/medium/high, "
+                "AWGN, Dataset, OFDMDataset.")
