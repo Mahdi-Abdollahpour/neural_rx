@@ -101,7 +101,8 @@ class NTDLChannel(tf.keras.layers.Layer):
                  tdl_models=["A"], # A, B, C, D, E
                  delay_spread_min=10,   # in nano seconds
                  delay_spread_max=300,  # in nano seconds
-                 doppler_shift_max=325  # Hz
+                 doppler_shift_max=325, # Hz
+                 doppler_shift_min=0    # Hz
                  ):
         super().__init__()
 
@@ -139,6 +140,7 @@ class NTDLChannel(tf.keras.layers.Layer):
         self._norm_channel = norm_channel
         self._apply_channel = ApplyOFDMChannel()
         self._speed = self._doppler_shift_max * sionna.SPEED_OF_LIGHT / self._carrier_frequency
+        self._min_speed = doppler_shift_min * sionna.SPEED_OF_LIGHT / self._carrier_frequency
         self._num_tdls = len(tdl_models)
 
 
@@ -170,6 +172,7 @@ class NTDLChannel(tf.keras.layers.Layer):
             tdl = TDL(model,
                       delay_spread,
                       self._carrier_frequency,
+                      min_speed=self._min_speed,
                       max_speed=self._speed,
                       num_tx_ant=self._num_tx_ant,
                       num_rx_ant=self._num_rx_ant,

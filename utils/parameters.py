@@ -347,6 +347,7 @@ class Parameters:
     def re_init(self,training=None, verbose=None, compute_cov=None, num_tx_eval=None,
                 n_size_bwp_eval=None, batch_size_eval=None, batch_size_eval_small=None,
                 max_ut_velocity_eval=None, min_ut_velocity_eval=None,
+                delay_spread_eval=None, doppler_eval=None,
                 channel_norm_eval=None, mat_filename_eval=None,
                 channel_type_eval=None, channel_models=None,
                 tdl_models=None, cdl_models=None,
@@ -380,6 +381,15 @@ class Parameters:
             self.max_ut_velocity_eval = max_ut_velocity_eval
         if min_ut_velocity_eval is not None:
             self.min_ut_velocity_eval = min_ut_velocity_eval
+        # (min, max) delay spread [ns] of the TDL/CDL models and Doppler [Hz]
+        # of NTDLlow / TDL-<X>; read by initialize_channel in evaluation only.
+        for name, value in (("delay_spread_eval", delay_spread_eval),
+                            ("doppler_eval", doppler_eval)):
+            if value is not None:
+                if not 0 <= value[0] <= value[1]:
+                    raise ValueError(f"{name} must satisfy 0 <= min <= max, "
+                                     f"got {value}")
+                setattr(self, name, tuple(value))
         if channel_norm_eval is not None:
             self.channel_norm_eval = channel_norm_eval
 
@@ -795,16 +805,23 @@ class Parameters:
         return bs_array, ut_array
 
     def initialize_channel(self,channel_type_eval=None, channel_models=None,
-                                tdl_models=None, cdl_models=None, compute_cov=False,
-                                delay_spread_min=10,   # in nano seconds
-                                delay_spread_max=300,  # in nano seconds
-                                doppler_shift_max=325  # Hz
-                                ):
+                                tdl_models=None, cdl_models=None, compute_cov=False):
 
-      
+
         ##############################
         ##### Initialize Channel #####
         ##############################
+
+        # Delay spread of the TDL/CDL models and Doppler of NTDLlow / TDL-<X>.
+        # Evaluation can override both (re_init's delay_spread_eval /
+        # doppler_eval); training always uses these defaults.
+        delay_spread_min, delay_spread_max = 10, 300    # in nano seconds
+        doppler_shift_min, doppler_shift_max = 0, 325   # Hz
+        if not self._training:
+            delay_spread_min, delay_spread_max = getattr(
+                self, "delay_spread_eval", (delay_spread_min, delay_spread_max))
+            doppler_shift_min, doppler_shift_max = getattr(
+                self, "doppler_eval", (doppler_shift_min, doppler_shift_max))
 
         # Enable/Disable random number of clusters for geometric channel models (implemented only for UMi)
         if hasattr(self, 'random_num_clusters'):
@@ -971,7 +988,8 @@ class Parameters:
                                     tdl_models=self.channel_models,
                                     delay_spread_min=delay_spread_min,   # in nano seconds
                                     delay_spread_max=delay_spread_max,  # in nano seconds
-                                    doppler_shift_max=doppler_shift_max  # Hz
+                                    doppler_shift_max=doppler_shift_max, # Hz
+                                    doppler_shift_min=doppler_shift_min  # Hz
                                     )
 
         # Per-sample TDL: every (sample, user) draws its profile uniformly
@@ -1007,7 +1025,8 @@ class Parameters:
                                     tdl_models=tdl_models_,
                                     delay_spread_min=delay_spread_min,   # in nano seconds
                                     delay_spread_max=delay_spread_max,  # in nano seconds
-                                    doppler_shift_max=doppler_shift_max  # Hz
+                                    doppler_shift_max=doppler_shift_max, # Hz
+                                    doppler_shift_min=doppler_shift_min  # Hz
                                     )
 
 
