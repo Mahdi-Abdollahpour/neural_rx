@@ -330,7 +330,31 @@ class BaselineReceiver(Layer):
             return_ch_est=True
         )
 
+        # Set by evaluate_metrics.py for -eval_mode mse. Perfect CSI keeps the
+        # full chain: its estimate is the ground truth.
+        self._ch_est_only = (getattr(sys_parameters, "ch_est_only", False) and
+                             sys_parameters.system not in (
+                                 "baseline_perf_csi_kbest",
+                                 "baseline_perf_csi_lmmse"))
+
     def call(self, inputs):
+        if self._ch_est_only:
+            # Channel estimation only. self._est is the estimator inside
+            # self._receiver, which returns its h_hat unchanged.
+            y, no = inputs
+            y = tf.ensure_shape(y, self._rx_slot_shape)
+            h_hat, _ = self._est([y, no])
+            h_hat = tf.ensure_shape(h_hat, self._ch_est_shape)
+            # Zero placeholders keep the output signature of the full chain
+            batch_size = tf.shape(y)[0]
+            b_hat = tf.zeros([batch_size, self._sys_parameters.max_num_tx,
+                              self._transmitter._tb_size], tf.float32)
+            if self._return_tb_status:
+                tb_crc_status = tf.zeros(
+                    [batch_size, self._sys_parameters.max_num_tx], tf.bool)
+                return b_hat, tb_crc_status, h_hat
+            return b_hat, h_hat
+
         if self._sys_parameters.system in ("baseline_perf_csi_kbest",
                                            "baseline_perf_csi_lmmse"):
             y, h, no = inputs
