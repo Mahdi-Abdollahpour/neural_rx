@@ -604,9 +604,10 @@ def training_loop(model, label, filename, training_logdir, training_seed,
     max_training_snr_db : [num_tx_values], float
         Upper bound of the SNR range for training in dB.
 
-    eval_ebno_db_arr : list
+    eval_ebno_db_arr : list or None
         EbNo points in dB the model loss is evaluated during training every 1k
         iterations.
+        None disables the periodic evaluation (no eval scalars are logged).
 
     eval_channel_type_arr : list of str or None
         Channel types the model is additionally evaluated on during training,
@@ -649,7 +650,10 @@ def training_loop(model, label, filename, training_logdir, training_seed,
         If True, training runs in XLA mode.
     """
 
-    print(f"Training with mixed MCS from arr. idx {mcs_arr_training_idx}. Eval EbNo at {eval_ebno_db_arr} dB.")
+    if eval_ebno_db_arr is None:
+        print(f"Training with mixed MCS from arr. idx {mcs_arr_training_idx}. Periodic eval disabled (eval_ebno_db_arr not set).")
+    else:
+        print(f"Training with mixed MCS from arr. idx {mcs_arr_training_idx}. Eval EbNo at {eval_ebno_db_arr} dB.")
 
     # Set the seed for reproducible trainings
     tf.random.set_seed(training_seed)
@@ -673,6 +677,13 @@ def training_loop(model, label, filename, training_logdir, training_seed,
         eval_channel_type_arr = getattr(sys_parameters,
                                         "eval_channel_type_arr", None)
     eval_channel_type_arr = _normalize_eval_channel_types(eval_channel_type_arr)
+    # Without eval EbNo points there is nothing to evaluate: skip building and
+    # warming up the eval channels (the warm-up indexes eval_ebno_db_arr).
+    if eval_ebno_db_arr is None and eval_channel_type_arr is not None:
+        print("Warning: eval_channel_type_arr is ignored because "
+              "eval_ebno_db_arr is not set (periodic eval disabled).",
+              flush=True)
+        eval_channel_type_arr = None
     # Only tensorize the eval SNR when the feature is in use: it removes one
     # trace per SNR point, but it also stops XLA constant-folding ebnodb2no,
     # which would perturb the RNG stream of existing runs.
@@ -1040,7 +1051,9 @@ def training_loop(model, label, filename, training_logdir, training_seed,
 
     # One entry per logged channel. The legacy path is a single entry with no
     # binding: nothing is ever swapped and every tag string is unchanged.
-    if eval_bindings:
+    if eval_ebno_db_arr is None:
+        eval_plan = []
+    elif eval_bindings:
         eval_plan = [(b, f" ch={b.label}") for b in eval_bindings]
     else:
         eval_plan = [(None, "")]

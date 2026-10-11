@@ -250,6 +250,12 @@ if hasattr(sys_parameters, "mcs_training_probs"):
 else:
     mcs_training_probs = None
 
+# absent key disables the periodic eval during training
+if hasattr(sys_parameters, "eval_ebno_db_arr"):
+    eval_ebno_db_arr = sys_parameters.eval_ebno_db_arr
+else:
+    eval_ebno_db_arr = None
+
 if args.v > 2:
     save_weights(sys_training, filename, save_format, args.v)
 
@@ -262,7 +268,7 @@ training_loop(sys_training,
               training_logdir=training_logdir,
               training_seed=training_seed,
               training_schedule=sys_parameters.training_schedule,
-              eval_ebno_db_arr=sys_parameters.eval_ebno_db_arr,
+              eval_ebno_db_arr=eval_ebno_db_arr,
               min_num_tx=sys_parameters.min_num_tx,
               max_num_tx=sys_parameters.max_num_tx,
               sys_parameters=sys_parameters,
