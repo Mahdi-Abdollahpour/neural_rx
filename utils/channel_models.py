@@ -210,7 +210,7 @@ class NTDLChannel(tf.keras.layers.Layer):
         outputs = [
             gen(
                 batch_size,
-                delay_spread=tf.random.uniform(
+                delay_spread=sionna.config.tf_rng.uniform(
                     shape=(),
                     minval=self._delay_spread_min,
                     maxval=self._delay_spread_max,
@@ -223,9 +223,9 @@ class NTDLChannel(tf.keras.layers.Layer):
         # Step 2: Stack outputs into a tensor
         all_outputs = tf.stack(outputs, axis=0)
 
-        # Step 3: Shuffle indices
-        indices = tf.range(k)
-        shuffled_indices = tf.random.shuffle(indices)
+        # Step 3: Shuffle indices (argsort of uniform draws is a uniform
+        # permutation, taken from tf_rng like every other draw)
+        shuffled_indices = tf.argsort(sionna.config.tf_rng.uniform([k]))
 
         # Step 4: Select first n indices
         selected_indices = shuffled_indices[:num_tx]
@@ -395,7 +395,7 @@ class NCDLChannel(tf.keras.layers.Layer):
         outputs = [
             gen(
                 batch_size,
-                delay_spread=tf.random.uniform(
+                delay_spread=sionna.config.tf_rng.uniform(
                     shape=(),
                     minval=self._delay_spread_min,
                     maxval=self._delay_spread_max,
@@ -407,9 +407,9 @@ class NCDLChannel(tf.keras.layers.Layer):
 
         all_outputs = tf.stack(outputs, axis=0)
 
-        # Randomly assign links to the active users
-        indices = tf.range(k)
-        shuffled_indices = tf.random.shuffle(indices)
+        # Randomly assign links to the active users (argsort of uniform
+        # draws is a uniform permutation)
+        shuffled_indices = tf.argsort(sionna.config.tf_rng.uniform([k]))
         selected_indices = shuffled_indices[:num_tx]
         selected_outputs = tf.gather(all_outputs, selected_indices, axis=0)
 
@@ -783,13 +783,13 @@ class DatasetChannel(ChannelModel):
             # samples in self._a alternating between both trajectories
             if not self._random_subsampling:
                 # no random sub-sampling: take subsequent two samples
-                ind = tf.random.uniform([batch_size],
+                ind = sionna.config.tf_rng.uniform([batch_size],
                                      maxval=self._num_examples//self._num_tx,
                                      dtype=tf.int32)
                 ind = tf.repeat(tf.expand_dims(ind, axis=-1),
                                 repeats=self._num_tx, axis=-1)
             else:
-                ind = tf.random.uniform([batch_size, self._num_tx],
+                ind = sionna.config.tf_rng.uniform([batch_size, self._num_tx],
                                      maxval=self._num_examples//self._num_tx,
                                      dtype=tf.int32)
             # sample subsequent points from all ues
@@ -1084,14 +1084,14 @@ class OFDMDatasetChannelSampler(ChannelModel):
         else:
             # Evaluation mode: keep the original "alternating users" idea.
             if not self._random_subsampling:
-                ind = tf.random.uniform([batch_size],
+                ind = sionna.config.tf_rng.uniform([batch_size],
                                         maxval=self._num_examples // self._num_tx,
                                         dtype=tf.int32)
                 ind = tf.repeat(tf.expand_dims(ind, axis=-1),
                                 repeats=self._num_tx,
                                 axis=-1)
             else:
-                ind = tf.random.uniform([batch_size, self._num_tx],
+                ind = sionna.config.tf_rng.uniform([batch_size, self._num_tx],
                                         maxval=self._num_examples // self._num_tx,
                                         dtype=tf.int32)
 

@@ -13,6 +13,7 @@ import core.runtime as _runtime
 
 import tensorflow as tf
 from tensorflow.keras import Model
+from sionna import config as sionna_config
 from sionna.channel import gen_single_sector_topology
 from sionna.utils import BinarySource, ebnodb2no, expand_to_rank, log10, flatten_dims, split_dim, insert_dims
 from .baseline_rx import BaselineReceiver
@@ -320,7 +321,10 @@ class E2E_Model(Model):
                      tf.ones_like(r),
                      tf.zeros_like(r))
         x = tf.expand_dims(x, axis=-1)
-        x_p = tf.map_fn(tf.random.shuffle, x)
+        # Per-row random permutation of the ports: argsort of uniform draws
+        # from tf_rng, as tf.random.shuffle replays under XLA
+        perm = tf.argsort(sionna_config.tf_rng.uniform(tf.shape(r)), axis=-1)
+        x_p = tf.gather(x, perm, batch_dims=1)
         x_p = tf.cast(x_p, tf.float32)
         return tf.squeeze(x_p, axis=-1)
 

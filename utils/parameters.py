@@ -851,6 +851,10 @@ class Parameters:
             "ds_aug", "ds_prob", "ds_shift_range", "lsp_shift",
             "rx_scramble", "rx_scramble_prob", "lam_range",
             "fix_ray_offsets", "aug_seed") if hasattr(self, k)}
+        # A fixed aug_seed would give every evaluation run the same knob
+        # draws; unseeded, UMiTDS takes them from sionna.config.tf_rng.
+        if not self._training:
+            umitds_kwargs.pop("aug_seed", None)
 
 
         if channel_type_eval is not None:
